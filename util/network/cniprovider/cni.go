@@ -9,7 +9,6 @@ import (
 	"time"
 
 	cni "github.com/containerd/go-cni"
-	"github.com/gofrs/flock"
 	resourcestypes "github.com/moby/buildkit/executor/resources/types"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/util/bklog"
@@ -17,6 +16,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sys/unix"
 )
 
 const aboveTargetGracePeriod = 5 * time.Minute
@@ -108,11 +108,18 @@ func (c *cniProvider) Close() error {
 
 func initLock() (func() error, error) {
 	if v := os.Getenv("BUILDKIT_CNI_INIT_LOCK_PATH"); v != "" {
-		l := flock.New(v)
-		if err := l.Lock(); err != nil {
+		f, err := os.OpenFile(v, os.O_RDWR|os.O_CREATE, 0600)
+		if err != nil {
 			return nil, err
 		}
-		return l.Unlock, nil
+		if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+			f.Close()
+			return nil, err
+		}
+		return func() error {
+			defer f.Close()
+			return unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		}, nil
 	}
 	return func() error { return nil }, nil
 }

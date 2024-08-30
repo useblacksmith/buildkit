@@ -8,7 +8,6 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/gofrs/flock"
 	"github.com/pkg/errors"
 )
 
@@ -34,13 +33,19 @@ func (ts *tokenSeeds) getSeed(host string) ([]byte, error) {
 		ts.m = map[string]seed{}
 	}
 
-	l := flock.New(filepath.Join(ts.dir, ".token_seed.lock"))
-	if err := l.Lock(); err != nil {
+	lockFile, err := os.OpenFile(filepath.Join(ts.dir, ".token_seed.lock"), os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not open lock file")
+	}
+	defer lockFile.Close()
+
+	err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
 		if !errors.Is(err, syscall.EROFS) && !errors.Is(err, os.ErrPermission) {
-			return nil, err
+			return nil, errors.Wrap(err, "could not acquire lock")
 		}
 	} else {
-		defer l.Unlock()
+		defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 	}
 
 	fp := filepath.Join(ts.dir, ".token_seed")

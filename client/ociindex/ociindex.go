@@ -5,8 +5,8 @@ import (
 	"io"
 	"os"
 	"path"
+	"syscall"
 
-	"github.com/gofrs/flock"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
@@ -33,16 +33,18 @@ func NewStoreIndex(storePath string) StoreIndex {
 }
 
 func (s StoreIndex) Read() (*ocispecs.Index, error) {
-	lock := flock.New(s.lockPath)
-	locked, err := lock.TryRLock()
+	lockFile, err := os.OpenFile(s.lockPath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return nil, errors.Wrapf(err, "could not open lock file %s", s.lockPath)
+	}
+	defer lockFile.Close()
+
+	err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
 	if err != nil {
 		return nil, errors.Wrapf(err, "could not lock %s", s.lockPath)
 	}
-	if !locked {
-		return nil, errors.Errorf("could not lock %s", s.lockPath)
-	}
 	defer func() {
-		lock.Unlock()
+		syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 		os.RemoveAll(s.lockPath)
 	}()
 
@@ -59,16 +61,18 @@ func (s StoreIndex) Read() (*ocispecs.Index, error) {
 
 func (s StoreIndex) Put(tag string, desc ocispecs.Descriptor) error {
 	// lock the store to prevent concurrent access
-	lock := flock.New(s.lockPath)
-	locked, err := lock.TryLock()
+	lockFile, err := os.OpenFile(s.lockPath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return errors.Wrapf(err, "could not open lock file %s", s.lockPath)
+	}
+	defer lockFile.Close()
+
+	err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
 		return errors.Wrapf(err, "could not lock %s", s.lockPath)
 	}
-	if !locked {
-		return errors.Errorf("could not lock %s", s.lockPath)
-	}
 	defer func() {
-		lock.Unlock()
+		syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 		os.RemoveAll(s.lockPath)
 	}()
 

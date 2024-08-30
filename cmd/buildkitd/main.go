@@ -21,7 +21,6 @@ import (
 	"github.com/containerd/platforms"
 	sddaemon "github.com/coreos/go-systemd/v22/daemon"
 	"github.com/docker/docker/pkg/reexec"
-	"github.com/gofrs/flock"
 	"github.com/hashicorp/go-multierror"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/cache/remotecache/azblob"
@@ -70,6 +69,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	tracev1 "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
@@ -319,8 +319,13 @@ func main() {
 		}
 
 		lockPath := filepath.Join(root, "buildkitd.lock")
-		lock := flock.New(lockPath)
-		locked, err := lock.TryLock()
+		lockFile, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0600)
+		if err != nil {
+			return errors.Wrapf(err, "could not open lock file %s", lockPath)
+		}
+		defer lockFile.Close()
+
+		locked, err := tryLockFcntl(lockFile)
 		if err != nil {
 			return errors.Wrapf(err, "could not lock %s", lockPath)
 		}
@@ -328,7 +333,7 @@ func main() {
 			return errors.Errorf("could not lock %s, another instance running?", lockPath)
 		}
 		defer func() {
-			lock.Unlock()
+			unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
 			os.RemoveAll(lockPath)
 		}()
 
@@ -1020,4 +1025,12 @@ func newMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
 		opts = append(opts, sdkmetric.WithReader(r))
 	}
 	return sdkmetric.NewMeterProvider(opts...), nil
+}
+
+func tryLockFcntl(f *os.File) (bool, error) {
+	err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	if err == unix.EWOULDBLOCK {
+		return false, nil
+	}
+	return err == nil, err
 }
