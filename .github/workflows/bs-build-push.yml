@@ -1,0 +1,60 @@
+name: Build and Push release
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  build-and-push:
+    runs-on: blacksmith
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Build using make
+        run: make binaries
+
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "[r2]" > ~/.config/rclone/rclone.conf
+          echo "type = s3" >> ~/.config/rclone/rclone.conf
+          echo "provider = Cloudflare" >> ~/.config/rclone/rclone.conf
+          echo "access_key_id = $R2_ACCESS_KEY_ID" >> ~/.config/rclone/rclone.conf
+          echo "secret_access_key = $R2_SECRET_ACCESS_KEY" >> ~/.config/rclone/rclone.conf
+          echo "endpoint = https://1ede90a8395416f286ba9f692dc6bacf.r2.cloudflarestorage.com" >> ~/.config/rclone/rclone.conf
+
+      - name: Push to bucket and store SHA
+        run: |
+          SHA=$(git rev-parse HEAD)
+          echo "SHA=$SHA" >> $GITHUB_ENV
+          rclone copy ./bin/build/buildkitd r2:useblacksmith/buildkit/master/$SHA
+
+      - name: Install Doppler CLI
+        run: |
+          sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates gnupg
+          curl -sLf --retry 3 --tlsv1.2 --proto "=https" 'https://packages.doppler.com/public/cli/gpg.DE2A7741A397C129.key' | sudo gpg --dearmor -o /usr/share/keyrings/doppler-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/doppler-archive-keyring.gpg] https://packages.doppler.com/public/cli/deb/debian any-version main" | sudo tee /etc/apt/sources.list.d/doppler-cli.list
+          sudo apt-get update && sudo apt-get install doppler
+
+      - name: Set Doppler token and update BUILDKITD_SHA
+        env:
+          DOPPLER_TOKEN: ${{ github.ref == 'refs/heads/master' && secrets.DOPPLER_TOKEN_MASTER || '' }}
+        run: |
+          if [ -n "$DOPPLER_TOKEN" ]; then
+            doppler configure set token $DOPPLER_TOKEN --scope .
+            doppler secrets set BUILDKITD_SHA $SHA
+          else
+            echo "Error: DOPPLER_TOKEN is empty"
+            exit 1
+          fi
