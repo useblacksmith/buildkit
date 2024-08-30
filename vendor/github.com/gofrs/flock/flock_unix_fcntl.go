@@ -15,7 +15,7 @@
 // This code is adapted from the Go package (go.22):
 // https://github.com/golang/go/blob/release-branch.go1.22/src/cmd/go/internal/lockedfile/internal/filelock/filelock_fcntl.go
 
-//go:build aix || (solaris && !illumos)
+//go:build darwin || dragonfly || freebsd || illumos || linux || netbsd || openbsd || aix || (solaris && !illumos)
 
 package flock
 
