@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/remotes/docker"
@@ -257,6 +258,7 @@ func main() {
 
 		if cfg.Debug {
 			logrus.SetLevel(logrus.DebugLevel)
+			bklog.L.Debugf("Debug mode enabled")
 		}
 		if cfg.Trace {
 			logrus.SetLevel(logrus.TraceLevel)
@@ -320,12 +322,15 @@ func main() {
 			return nil
 		}
 
+		beforeLock := time.Now()
 		lockPath := filepath.Join(root, "buildkitd.lock")
 		lock := flock.New(lockPath)
+		bklog.L.Infof("before lock: %s", time.Since(beforeLock))
 		locked, err := lock.TryLock()
 		if err != nil {
 			return errors.Wrapf(err, "could not lock %s", lockPath)
 		}
+		bklog.L.Infof("after lock: %s", time.Since(beforeLock))
 		if !locked {
 			return errors.Errorf("could not lock %s, another instance running?", lockPath)
 		}
@@ -336,15 +341,19 @@ func main() {
 
 		// listeners have to be initialized before the controller
 		// https://github.com/moby/buildkit/issues/4618
+		beforeListeners := time.Now()
 		listeners, err := newGRPCListeners(cfg.GRPC)
 		if err != nil {
 			return err
 		}
+		bklog.L.Infof("after listeners: %s", time.Since(beforeListeners))
 
+		beforeController := time.Now()
 		controller, err := newController(ctx, c, &cfg)
 		if err != nil {
 			return err
 		}
+		bklog.L.Infof("after controller: %s", time.Since(beforeController))
 		defer controller.Close()
 
 		healthv1.RegisterHealthServer(server, health.NewServer())
@@ -785,6 +794,7 @@ func newController(ctx context.Context, c *cli.Context, cfg *config.Config) (*co
 		}
 	}
 
+	beforeWorkerController := time.Now()
 	wc, err := newWorkerController(c, workerInitializerOpt{
 		config:         cfg,
 		sessionManager: sessionManager,
@@ -793,6 +803,7 @@ func newController(ctx context.Context, c *cli.Context, cfg *config.Config) (*co
 	if err != nil {
 		return nil, err
 	}
+	bklog.L.Infof("after worker controller: %s", time.Since(beforeWorkerController))
 	frontends := map[string]frontend.Frontend{}
 
 	if cfg.Frontends.Dockerfile.Enabled == nil || *cfg.Frontends.Dockerfile.Enabled {
@@ -870,8 +881,9 @@ func newWorkerController(c *cli.Context, wiOpt workerInitializerOpt) (*worker.Co
 			return nil, err
 		}
 		for _, w := range ws {
+			beforePlatformCall := time.Now()
 			p := w.Platforms(false)
-			bklog.L.Infof("found worker %q, labels=%v, platforms=%v", w.ID(), w.Labels(), formatPlatforms(p))
+			bklog.L.Infof("found worker %q, labels=%v, platforms=%v, platforms call took %s", w.ID(), w.Labels(), formatPlatforms(p), time.Since(beforePlatformCall))
 			archutil.WarnIfUnsupported(p)
 			if err = wc.Add(w); err != nil {
 				return nil, err

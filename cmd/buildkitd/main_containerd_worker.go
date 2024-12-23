@@ -263,9 +263,11 @@ func applyContainerdFlags(c *cli.Context, cfg *config.Config) error {
 }
 
 func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker.Worker, error) {
+	beforeFlags := time.Now()
 	if err := applyContainerdFlags(c, common.config); err != nil {
 		return nil, err
 	}
+	bklog.L.Infof("after flags: %s", time.Since(beforeFlags))
 
 	cfg := common.config.Workers.Containerd
 
@@ -306,6 +308,7 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 
 	var runtime *containerd.RuntimeInfo
 	if cfg.Runtime.Name != "" {
+		beforeRuntime := time.Now()
 		opts := getRuntimeOptionsType(cfg.Runtime.Name)
 
 		t, err := toml.TreeFromMap(cfg.Runtime.Options)
@@ -322,6 +325,7 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 			Path:    cfg.Runtime.Path,
 			Options: opts,
 		}
+		bklog.L.Infof("after runtime setup: %s", time.Since(beforeRuntime))
 	}
 
 	workerOpts := containerd.WorkerOptions{
@@ -341,10 +345,14 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 		Runtime:         runtime,
 	}
 
+	beforeWorkerOpt := time.Now()
 	opt, err := containerd.NewWorkerOpt(workerOpts, ctd.WithTimeout(60*time.Second))
 	if err != nil {
 		return nil, err
 	}
+	bklog.L.Infof("after worker opt: %s", time.Since(beforeWorkerOpt))
+
+	beforeGettingOpts := time.Now()
 	opt.GCPolicy = getGCPolicy(cfg.GCConfig, common.config.Root)
 	opt.BuildkitVersion = getBuildkitVersion()
 	opt.RegistryHosts = resolverFunc(common.config)
@@ -356,10 +364,15 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 		}
 		opt.Platforms = platforms
 	}
+	bklog.L.Infof("after getting opts: %s", time.Since(beforeGettingOpts))
+
+	beforeNewWorker := time.Now()
 	w, err := base.NewWorker(context.TODO(), opt)
 	if err != nil {
 		return nil, err
 	}
+	bklog.L.Infof("after new worker: %s", time.Since(beforeNewWorker))
+
 	return []worker.Worker{w}, nil
 }
 
