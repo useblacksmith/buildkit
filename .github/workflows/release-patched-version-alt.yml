@@ -1,0 +1,331 @@
+name: Release Patched Version (Alternative)
+
+# This alternative workflow avoids PAT requirements by:
+# 1. Excluding workflow files from patches
+# 2. Using default GITHUB_TOKEN which works for non-workflow files
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_version:
+        description: 'Upstream version to patch (e.g., v0.17.0)'
+        required: true
+        type: string
+      release_suffix:
+        description: 'Suffix for release (default: blacksmith)'
+        required: false
+        type: string
+        default: 'blacksmith'
+
+permissions:
+  contents: write
+
+jobs:
+  create-patched-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.create-release-branch.outputs.release_tag }}
+      patch_count: ${{ steps.create-release-branch.outputs.patch_count }}
+      patch_list: ${{ steps.create-release-branch.outputs.patch_list }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use default GITHUB_TOKEN
+
+      - name: Setup git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream https://github.com/moby/buildkit.git || true
+          git fetch upstream master --tags
+          git fetch origin master
+
+      - name: Verify upstream version exists
+        run: |
+          if ! git rev-parse "refs/tags/${{ github.event.inputs.upstream_version }}" >/dev/null 2>&1; then
+            echo "❌ Upstream version ${{ github.event.inputs.upstream_version }} not found"
+            echo ""
+            echo "Available recent versions:"
+            git tag -l 'v*.*.*' | grep -v '\-' | sort -rV | head -20
+            exit 1
+          fi
+          echo "✅ Found upstream version ${{ github.event.inputs.upstream_version }}"
+
+      - name: Create patched release branch
+        id: create-release-branch
+        run: |
+          VERSION="${{ github.event.inputs.upstream_version }}"
+          SUFFIX="${{ github.event.inputs.release_suffix }}"
+          RELEASE_TAG="${VERSION}-${SUFFIX}"
+          RELEASE_BRANCH="${VERSION}-${SUFFIX}"
+
+          # Check if already exists
+          if git rev-parse "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "❌ Release $RELEASE_TAG already exists"
+            echo ""
+            echo "To recreate it, first delete the existing tag:"
+            echo "  git push origin --delete $RELEASE_TAG"
+            echo "  git push origin --delete $RELEASE_BRANCH"
+            exit 1
+          fi
+
+          # Checkout upstream version
+          echo "Creating release branch from $VERSION..."
+          git checkout -b "$RELEASE_BRANCH" "$VERSION"
+
+          # Find all commits that are in origin/master but not in upstream/master
+          # EXCLUDE commits that modify workflow files
+          echo ""
+          echo "Finding patches to apply (excluding workflow changes)..."
+          PATCHES=$(git rev-list upstream/master..origin/master --reverse --no-merges)
+
+          if [ -z "$PATCHES" ]; then
+            echo "⚠️  No patches found. Your master branch has no commits ahead of upstream."
+            exit 1
+          fi
+
+          # Apply patches and collect results
+          APPLIED_PATCHES=""
+          FAILED_PATCHES=""
+          SKIPPED_PATCHES=""
+          SUCCESS_COUNT=0
+          SKIP_COUNT=0
+
+          for COMMIT in $PATCHES; do
+            COMMIT_MSG=$(git log -1 --pretty=format:"%h: %s" "$COMMIT")
+            FULL_MSG=$(git log -1 --pretty=format:"%s" "$COMMIT")
+
+            # Check if commit modifies workflow files
+            WORKFLOW_CHANGES=$(git diff-tree --no-commit-id --name-only -r "$COMMIT" | grep "^.github/workflows/" || true)
+
+            if [ -n "$WORKFLOW_CHANGES" ]; then
+              echo "⏭️  Skipping $COMMIT_MSG (modifies workflow files)"
+              if [ -n "$SKIPPED_PATCHES" ]; then
+                SKIPPED_PATCHES=$(printf "%s\n- %s (workflow changes)" "$SKIPPED_PATCHES" "$FULL_MSG")
+              else
+                SKIPPED_PATCHES="- $FULL_MSG (workflow changes)"
+              fi
+              SKIP_COUNT=$((SKIP_COUNT + 1))
+              continue
+            fi
+
+            echo "Applying $COMMIT_MSG..."
+            if git cherry-pick "$COMMIT" >/dev/null 2>&1; then
+              echo "  ✅ Success"
+              if [ -n "$APPLIED_PATCHES" ]; then
+                APPLIED_PATCHES=$(printf "%s\n- %s" "$APPLIED_PATCHES" "$FULL_MSG")
+              else
+                APPLIED_PATCHES="- $FULL_MSG"
+              fi
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+              echo "  ❌ Failed (conflicts with this version)"
+              if [ -n "$FAILED_PATCHES" ]; then
+                FAILED_PATCHES=$(printf "%s\n- %s" "$FAILED_PATCHES" "$FULL_MSG")
+              else
+                FAILED_PATCHES="- $FULL_MSG"
+              fi
+              git cherry-pick --abort || true
+            fi
+          done
+
+          echo ""
+          echo "========================================="
+          TOTAL_COUNT=$(echo "$PATCHES" | wc -l | tr -d ' ')
+          echo "Processed $TOTAL_COUNT patches:"
+          echo "  Applied: $SUCCESS_COUNT"
+          echo "  Skipped: $SKIP_COUNT (workflow changes)"
+          echo "  Failed: $((TOTAL_COUNT - SUCCESS_COUNT - SKIP_COUNT))"
+
+          if [ -n "$APPLIED_PATCHES" ]; then
+            echo ""
+            echo "✅ Successfully applied:"
+            echo "$APPLIED_PATCHES"
+          fi
+
+          if [ -n "$SKIPPED_PATCHES" ]; then
+            echo ""
+            echo "⏭️  Skipped (workflow changes):"
+            echo "$SKIPPED_PATCHES"
+          fi
+
+          if [ -n "$FAILED_PATCHES" ]; then
+            echo ""
+            echo "⚠️  Failed to apply:"
+            echo "$FAILED_PATCHES"
+          fi
+
+          if [ "$SUCCESS_COUNT" -eq 0 ]; then
+            echo ""
+            echo "❌ No patches could be applied to $VERSION"
+            exit 1
+          fi
+
+          # Push branch and tag
+          echo ""
+          echo "Pushing branch and tag..."
+          if ! git push origin "$RELEASE_BRANCH"; then
+            echo "❌ Failed to push release branch $RELEASE_BRANCH"
+            exit 1
+          fi
+
+          # Create annotated tag with patch list
+          TAG_MSG=$(printf "Release %s with %s patches\n\nPatches applied:\n%s" "$VERSION" "$SUCCESS_COUNT" "$APPLIED_PATCHES")
+          if [ -n "$SKIPPED_PATCHES" ]; then
+            TAG_MSG=$(printf "%s\n\nSkipped (workflow changes):\n%s" "$TAG_MSG" "$SKIPPED_PATCHES")
+          fi
+
+          git tag -a "$RELEASE_TAG" -m "$TAG_MSG"
+
+          if ! git push origin "$RELEASE_TAG"; then
+            echo "❌ Failed to push release tag $RELEASE_TAG"
+            echo "Note: Release branch $RELEASE_BRANCH was already pushed"
+            exit 1
+          fi
+
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "patch_count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
+          echo "patch_list<<EOF" >> $GITHUB_OUTPUT
+          echo "$APPLIED_PATCHES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  # Build and release jobs remain the same...
+  build-binaries:
+    needs: create-patched-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+
+    steps:
+      - name: Checkout patched release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-patched-release.outputs.release_tag }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          echo "Building ${{ matrix.goos }}/${{ matrix.goarch }}..."
+
+          # Create bin directory
+          mkdir -p bin
+
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            go build -o bin/buildkitd ./cmd/buildkitd
+            go build -o bin/buildctl ./cmd/buildctl
+          else
+            # macOS only has buildctl
+            go build -o bin/buildctl ./cmd/buildctl
+          fi
+
+          # Create tarball
+          tar -czf buildkit-${{ needs.create-patched-release.outputs.release_tag }}-${{ matrix.suffix }}.tar.gz -C bin .
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.suffix }}
+          path: buildkit-*.tar.gz
+
+  create-github-release:
+    needs: [create-patched-release, build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: release-files
+
+      - name: Generate checksums
+        run: |
+          cd release-files
+          sha256sum *.tar.gz > SHA256SUMS
+          echo "Checksums:"
+          cat SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-patched-release.outputs.release_tag }}
+          name: BuildKit ${{ github.event.inputs.upstream_version }} (Patched)
+          body: |
+            # BuildKit ${{ github.event.inputs.upstream_version }} - Patched Release
+
+            This release includes upstream BuildKit ${{ github.event.inputs.upstream_version }} with ${{ needs.create-patched-release.outputs.patch_count }} production patches automatically applied from our master branch.
+
+            **Note**: Patches that modify workflow files were excluded from this release.
+
+            ## Patches Included
+            ${{ needs.create-patched-release.outputs.patch_list }}
+
+            ## Installation
+
+            ### Linux (AMD64)
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.create-patched-release.outputs.release_tag }}/buildkit-${{ needs.create-patched-release.outputs.release_tag }}-linux-amd64.tar.gz | tar xz
+            sudo mv buildkitd buildctl /usr/local/bin/
+            ```
+
+            ### Linux (ARM64)
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.create-patched-release.outputs.release_tag }}/buildkit-${{ needs.create-patched-release.outputs.release_tag }}-linux-arm64.tar.gz | tar xz
+            sudo mv buildkitd buildctl /usr/local/bin/
+            ```
+
+            ### macOS (Intel)
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.create-patched-release.outputs.release_tag }}/buildkit-${{ needs.create-patched-release.outputs.release_tag }}-darwin-amd64.tar.gz | tar xz
+            sudo mv buildctl /usr/local/bin/
+            ```
+
+            ### macOS (Apple Silicon)
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.create-patched-release.outputs.release_tag }}/buildkit-${{ needs.create-patched-release.outputs.release_tag }}-darwin-arm64.tar.gz | tar xz
+            sudo mv buildctl /usr/local/bin/
+            ```
+
+            ## Source
+
+            - **Base version**: [BuildKit ${{ github.event.inputs.upstream_version }}](https://github.com/moby/buildkit/releases/tag/${{ github.event.inputs.upstream_version }})
+            - **Patches from**: [`master`](https://github.com/${{ github.repository }}/tree/master) branch
+            - **Release tag**: [`${{ needs.create-patched-release.outputs.release_tag }}`](https://github.com/${{ github.repository }}/tree/${{ needs.create-patched-release.outputs.release_tag }})
+
+            ---
+            *This release was automatically generated. Workflow file changes are excluded to avoid authentication issues.*
+          files: |
+            release-files/*
+          draft: false
+          prerelease: false

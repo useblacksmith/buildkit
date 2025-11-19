@@ -4,42 +4,56 @@
 
 This fork maintains patches on top of upstream BuildKit using a rebase workflow. Our `master` branch contains upstream BuildKit plus our custom patches rebased on top.
 
-## Setup Requirements
+## Release Strategy
 
-**Required**: You must create a Personal Access Token for the workflows to function properly:
+We use BuildKit's existing `buildkit.yml` workflow to build and release our patched versions. This ensures consistency with upstream's build process.
 
-1. Go to GitHub Settings > Developer settings > Personal access tokens > Tokens (classic)
-2. Click "Generate new token (classic)"
-3. Give it a descriptive name (e.g., "BuildKit Fork Workflow")
-4. Select these scopes:
-   - `repo` (all checkboxes under repo)
-   - `workflow` (update GitHub Action workflows)
-5. Generate the token and copy it
-6. Go to your fork's Settings > Secrets and variables > Actions
-7. Click "New repository secret"
-8. Name: `WORKFLOW_TOKEN`
-9. Value: Paste your Personal Access Token
-
-This token is necessary because:
-- The default `GITHUB_TOKEN` cannot push changes to workflow files
-- Some patches may include modifications to `.github/workflows/*.yml` files
+### Process:
+1. **Prepare**: Use `prepare-patched-release.yml` to cherry-pick patches onto an upstream tag
+2. **Review**: Check which patches were applied successfully
+3. **Push**: Manually push the tag to trigger BuildKit's release workflow
+4. **Release**: The existing `buildkit.yml` automatically builds and publishes binaries
 
 ## Creating a Patched Release
 
-To deploy a patched version of BuildKit:
+### Step 1: Prepare the Release
 
 ```bash
-# Create release for v0.17.0 with all our patches
-gh workflow run release-patched-version.yml -f upstream_version=v0.17.0
+# Run the prepare workflow to cherry-pick patches
+gh workflow run prepare-patched-release.yml -f upstream_version=v0.17.0
 ```
 
-This workflow:
-1. Finds all commits in `origin/master` that aren't in `upstream/master` (our patches)
-2. Cherry-picks each patch onto the upstream version tag
-3. Builds binaries for Linux and macOS (amd64/arm64)
-4. Creates a GitHub release with downloadable artifacts
+This workflow will:
+1. Cherry-pick all patches from master onto v0.17.0
+2. Create a local tag `v0.17.0-blacksmith`
+3. Show you which patches succeeded/failed
+4. Give you the exact commands to complete the release
 
-The release will be tagged as `v0.17.0-blacksmith`.
+### Step 2: Review and Push
+
+Check the workflow output, then run locally:
+
+```bash
+# Clone and setup
+git clone https://github.com/useblacksmith/buildkit.git
+cd buildkit
+git fetch --all --tags
+
+# Push the tag (this triggers buildkit.yml)
+git push origin v0.17.0-blacksmith
+
+# The existing buildkit.yml workflow will now:
+# - Build multi-platform binaries
+# - Create Docker images
+# - Publish a GitHub release
+```
+
+### Why This Approach?
+
+- **No PAT complexity**: If your patches don't modify workflows, you can use regular git push
+- **Uses upstream's build**: The existing `buildkit.yml` handles all the complex build logic
+- **Manual control**: You review patches before pushing the release
+- **Cleaner**: We don't duplicate BuildKit's release logic
 
 ## Keeping Synced with Upstream
 
