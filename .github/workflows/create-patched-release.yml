@@ -1,7 +1,8 @@
-name: Prepare Patched Release
+name: Create Patched Release
 
-# This workflow prepares a patched release but DOES NOT push it
-# After review, you manually push the tag which triggers buildkit.yml
+# This workflow creates a patched release by:
+# 1. Cherry-picking patches onto an upstream tag
+# 2. Pushing the tag to trigger buildkit.yml
 
 on:
   workflow_dispatch:
@@ -20,13 +21,14 @@ permissions:
   contents: write
 
 jobs:
-  prepare-release:
+  create-release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.WORKFLOW_TOKEN }}
 
       - name: Setup git
         run: |
@@ -66,9 +68,10 @@ jobs:
             exit 1
           fi
 
-          # Checkout upstream version
+          # Checkout upstream version with a temp branch name to avoid conflicts
           echo "Creating release branch from $VERSION..."
-          git checkout -b "$RELEASE_BRANCH" "$VERSION"
+          TEMP_BRANCH="temp-${RELEASE_BRANCH}-$$"
+          git checkout -b "$TEMP_BRANCH" "$VERSION"
 
           # Find all commits that are in origin/master but not in upstream/master
           echo ""
@@ -145,47 +148,48 @@ jobs:
             exit 1
           fi
 
-          # Create annotated tag locally
+          # Create annotated tag
           TAG_MSG=$(printf "Release %s with %s patches\n\nPatches applied:\n%s" "$VERSION" "$SUCCESS_COUNT" "$APPLIED_PATCHES")
           git tag -a "$RELEASE_TAG" -m "$TAG_MSG"
 
+          # Push the tag explicitly using refs/tags/ to avoid ambiguity
           echo ""
-          echo "========================================="
-          echo "📦 RELEASE PREPARED SUCCESSFULLY"
-          echo "========================================="
-          echo ""
-          echo "Branch created: $RELEASE_BRANCH"
-          echo "Tag created: $RELEASE_TAG"
-          echo ""
-
-          if [ "$HAS_WORKFLOW_CHANGES" = true ]; then
-            echo "⚠️  WARNING: This release contains workflow file changes!"
-            echo "You'll need a Personal Access Token with 'workflow' scope to push."
+          echo "Pushing release tag..."
+          if git push origin "refs/tags/$RELEASE_TAG"; then
+            echo "✅ Successfully pushed tag: $RELEASE_TAG"
             echo ""
-          fi
-
-          echo "To complete the release, run these commands locally:"
-          echo ""
-          echo "  # Clone and setup"
-          echo "  git clone https://github.com/${{ github.repository }}.git"
-          echo "  cd buildkit"
-          echo "  git remote add upstream https://github.com/moby/buildkit.git"
-          echo "  git fetch --all --tags"
-          echo ""
-          echo "  # Push the release (this will trigger buildkit.yml)"
-          if [ "$HAS_WORKFLOW_CHANGES" = true ]; then
-            echo "  # Note: Use a PAT with 'workflow' scope for this push"
-            echo "  git push https://<YOUR_PAT>@github.com/${{ github.repository }}.git $RELEASE_TAG"
+            echo "========================================="
+            echo "📦 RELEASE CREATED SUCCESSFULLY"
+            echo "========================================="
+            echo ""
+            echo "Tag pushed: $RELEASE_TAG"
+            echo ""
+            echo "The buildkit.yml workflow will now:"
+            echo "- Build multi-platform binaries"
+            echo "- Create Docker images"
+            echo "- Publish a GitHub release"
+            echo ""
+            echo "Monitor progress at:"
+            echo "https://github.com/${{ github.repository }}/actions"
+            echo ""
           else
-            echo "  git push origin $RELEASE_TAG"
+            echo "❌ Failed to push tag"
+            echo ""
+            if [ "$HAS_WORKFLOW_CHANGES" = true ]; then
+              echo "This might be because the release contains workflow file changes."
+              echo "You may need to push the tag manually with a PAT that has workflow permissions."
+            fi
+            echo ""
+            echo "To push manually:"
+            echo "  git clone https://github.com/${{ github.repository }}.git"
+            echo "  cd buildkit"
+            echo "  git fetch --all --tags"
+            echo "  # Delete any conflicting branch"
+            echo "  git push origin --delete $RELEASE_TAG 2>/dev/null || true"
+            echo "  # Push the tag explicitly"
+            echo "  git push origin refs/tags/$RELEASE_TAG"
+            exit 1
           fi
-          echo ""
-          echo "  # Optionally push the branch too"
-          echo "  git push origin $RELEASE_BRANCH"
-          echo ""
-          echo "Once pushed, the tag will trigger the buildkit.yml workflow"
-          echo "which will build and release the binaries automatically."
-          echo ""
 
           # Save info for artifact
           cat > release-info.txt << EOF
