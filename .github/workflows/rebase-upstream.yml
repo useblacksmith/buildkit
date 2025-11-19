@@ -52,8 +52,17 @@ jobs:
             fi
 
             # Push the rebased master
-            git push origin master --force-with-lease
+            if ! git push origin master --force-with-lease; then
+              echo "❌ Rebase succeeded locally but failed to push to remote"
+              echo ""
+              echo "To push manually:"
+              echo "  git push origin master --force-with-lease"
+              echo ""
+              echo "rebase_status=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
 
+            echo "✅ Successfully pushed rebased master to origin"
             echo "rebase_status=success" >> $GITHUB_OUTPUT
             echo "patch_count=$AFTER_COUNT" >> $GITHUB_OUTPUT
           else
