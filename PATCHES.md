@@ -1,78 +1,84 @@
 # BuildKit Patches
 
-This fork maintains production-ready patches on top of upstream BuildKit releases.
+This fork maintains production-ready patches on top of upstream BuildKit using a rebase workflow.
 
-## Active Patches
+## How It Works
 
-### 1. History Database Corruption Recovery
-- **Branch**: `fix-history-db-corruption`
-- **Status**: Pending upstream review
-- **PR**: [TBD - to be submitted]
+- **Master branch** = upstream BuildKit + our patches (always rebased on top)
+- **Automatic discovery** = No manual tracking of patches
+- **Releases** = Cherry-pick all our patches onto upstream release tags
 
-**Description**: Adds automatic corruption recovery to `history.db` to match the existing recovery mechanism in `cache.db`. This prevents BuildKit from failing to start when the history database is corrupted, which commonly occurs with abrupt shutdowns or when using network block devices with snapshots.
+## Current Patches
 
-**Files Modified**:
-- `cmd/buildkitd/main.go` - Use SafeOpen for history.db
-- `solver/bboltcachestorage/storage.go` - Switch to shared SafeOpen
-- `util/db/boltutil/safe_open.go` - New shared recovery logic
-
-## Patching Process
-
-This repository uses GitHub Actions for manual patch and release:
-
-1. **Trigger workflow** - Manually specify upstream version to patch
-2. **Apply patches** - Cherry-picks patches onto the specified release
-3. **Build binaries** - Multi-platform binaries for Linux and macOS (amd64, arm64)
-4. **Create GitHub release** - With downloadable binaries and checksums
-
-## Version Naming Convention
-
-Patched versions use the suffix `-blacksmith`:
-- Upstream: `v0.17.0`
-- Patched: `v0.17.0-blacksmith`
-
-## Using Patched Releases
-
-### Download Binaries
+To see all patches we're carrying:
 ```bash
-# Linux AMD64
-wget https://github.com/useblacksmith/buildkit/releases/download/v0.17.0-blacksmith/buildkit-v0.17.0-blacksmith-linux-amd64.tar.gz
-tar -xzf buildkit-v0.17.0-blacksmith-linux-amd64.tar.gz
+git log upstream/master..origin/master --oneline
+```
+
+### Example Patches
+1. **History Database Corruption Recovery** - Prevents startup failures when history.db is corrupted
+2. Additional patches added as needed via PRs to master
+
+## Developer Workflow
+
+1. Create fixes on feature branches
+2. Open PRs against `master`
+3. After merge, patches are automatically included in future releases
+
+See [FORK_WORKFLOW.md](FORK_WORKFLOW.md) for detailed developer instructions.
+
+## Creating a Release
+
+```bash
+# Create v0.17.0-blacksmith with all our patches
+gh workflow run release-patched-version.yml -f upstream_version=v0.17.0
+
+# Or via GitHub UI: Actions → Release Patched Version → Run workflow
+```
+
+The workflow automatically:
+- Finds all commits in our master that aren't in upstream
+- Cherry-picks them onto the upstream release
+- Builds binaries for Linux/macOS (amd64/arm64)
+- Creates GitHub release with artifacts
+
+## Using Released Binaries
+
+### Linux
+```bash
+# AMD64
+curl -L https://github.com/useblacksmith/buildkit/releases/download/v0.17.0-blacksmith/buildkit-v0.17.0-blacksmith-linux-amd64.tar.gz | tar xz
 sudo mv buildkitd buildctl /usr/local/bin/
 
-# macOS Apple Silicon
-wget https://github.com/useblacksmith/buildkit/releases/download/v0.17.0-blacksmith/buildkit-v0.17.0-blacksmith-darwin-arm64.tar.gz
-tar -xzf buildkit-v0.17.0-blacksmith-darwin-arm64.tar.gz
+# ARM64
+curl -L https://github.com/useblacksmith/buildkit/releases/download/v0.17.0-blacksmith/buildkit-v0.17.0-blacksmith-linux-arm64.tar.gz | tar xz
+sudo mv buildkitd buildctl /usr/local/bin/
+```
+
+### macOS
+```bash
+# Intel
+curl -L https://github.com/useblacksmith/buildkit/releases/download/v0.17.0-blacksmith/buildkit-v0.17.0-blacksmith-darwin-amd64.tar.gz | tar xz
+sudo mv buildctl /usr/local/bin/
+
+# Apple Silicon
+curl -L https://github.com/useblacksmith/buildkit/releases/download/v0.17.0-blacksmith/buildkit-v0.17.0-blacksmith-darwin-arm64.tar.gz | tar xz
 sudo mv buildctl /usr/local/bin/
 ```
 
-## Creating a Patched Release
+## Maintenance
 
-To patch a specific upstream version:
-
+### Keep master updated (weekly/monthly)
 ```bash
-# Using GitHub CLI
-gh workflow run patch-and-release.yml -f upstream_version=v0.17.0
-
-# Or via GitHub UI
-# Go to Actions → Patch and Release BuildKit → Run workflow
-# Enter the upstream version (e.g., v0.17.0)
+gh workflow run rebase-upstream.yml
 ```
 
-## Verification
+This rebases our patches on top of latest upstream. When upstream merges one of our patches, it automatically disappears from our stack.
 
-All releases include SHA256 checksums:
-
+### Manual rebase if needed
 ```bash
-# Download and verify
-wget https://github.com/useblacksmith/buildkit/releases/download/v0.17.0-blacksmith/SHA256SUMS
-sha256sum -c SHA256SUMS
+git checkout master
+git fetch upstream
+git rebase upstream/master
+git push origin master --force-with-lease
 ```
-
-## Contributing
-
-When adding new patches:
-1. Create a feature branch from master
-2. Make your changes
-3. Update this file with patch details
-4. Update the `PATCH_BRANCH` in the workflow if creating a new patch type
