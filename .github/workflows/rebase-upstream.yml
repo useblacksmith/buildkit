@@ -6,6 +6,10 @@ on:
     # Run weekly on Mondays at 9am UTC
     - cron: '0 9 * * 1'
 
+permissions:
+  contents: write
+  issues: write
+
 jobs:
   rebase:
     runs-on: ubuntu-latest
@@ -14,7 +18,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.WORKFLOW_TOKEN }}
 
       - name: Setup git
         run: |
