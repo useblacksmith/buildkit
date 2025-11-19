@@ -207,6 +207,9 @@ $APPLIED_PATCHES"
         run: |
           echo "Building ${{ matrix.goos }}/${{ matrix.goarch }}..."
 
+          # Create bin directory
+          mkdir -p bin
+
           if [ "${{ matrix.goos }}" = "linux" ]; then
             go build -o bin/buildkitd ./cmd/buildkitd
             go build -o bin/buildctl ./cmd/buildctl
