@@ -145,13 +145,21 @@ jobs:
           # Push branch and tag
           echo ""
           echo "Pushing branch and tag..."
-          git push origin "$RELEASE_BRANCH"
+          if ! git push origin "$RELEASE_BRANCH"; then
+            echo "❌ Failed to push release branch $RELEASE_BRANCH"
+            exit 1
+          fi
 
           # Create annotated tag with patch list
           TAG_MSG=$(printf "Release %s with %s patches\n\nPatches applied:\n%s" "$VERSION" "$SUCCESS_COUNT" "$APPLIED_PATCHES")
 
           git tag -a "$RELEASE_TAG" -m "$TAG_MSG"
-          git push origin "$RELEASE_TAG"
+
+          if ! git push origin "$RELEASE_TAG"; then
+            echo "❌ Failed to push release tag $RELEASE_TAG"
+            echo "Note: Release branch $RELEASE_BRANCH was already pushed"
+            exit 1
+          fi
 
           echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
           echo "patch_count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
