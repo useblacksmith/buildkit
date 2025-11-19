@@ -1,0 +1,238 @@
+name: Patch and Release BuildKit
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_version:
+        description: 'Upstream version to patch (e.g., v0.17.0)'
+        required: true
+        type: string
+
+env:
+  PATCH_BRANCH: fix-history-db-corruption
+  PATCH_IDENTIFIER: blacksmith
+
+jobs:
+  patch-and-build:
+    runs-on: ubuntu-latest
+    outputs:
+      patched_version: ${{ steps.patch.outputs.patched_version }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/moby/buildkit.git || true
+          git fetch upstream --tags
+
+      - name: Verify upstream version exists
+        run: |
+          VERSION="${{ github.event.inputs.upstream_version }}"
+          if ! git rev-parse "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "Error: Upstream version $VERSION not found"
+            echo "Available versions:"
+            git tag -l 'v*.*.*' | grep -v '\-' | sort -rV | head -20
+            exit 1
+          fi
+          echo "Found upstream version: $VERSION"
+
+      - name: Apply patch to release
+        id: patch
+        run: |
+          VERSION="${{ github.event.inputs.upstream_version }}"
+          PATCHED_TAG="${VERSION}-${PATCH_IDENTIFIER}"
+
+          # Get the patch commit SHA
+          PATCH_COMMIT=$(git rev-parse origin/${{ env.PATCH_BRANCH }} 2>/dev/null || echo "")
+          if [ -z "$PATCH_COMMIT" ]; then
+            echo "Error: Patch branch ${{ env.PATCH_BRANCH }} not found"
+            exit 1
+          fi
+          echo "Using patch commit: $PATCH_COMMIT"
+
+          # Check if already patched
+          if git rev-parse "refs/tags/$PATCHED_TAG" >/dev/null 2>&1; then
+            echo "Version $VERSION already patched as $PATCHED_TAG"
+            echo "To re-patch, delete the existing tag first"
+            exit 1
+          fi
+
+          # Create patched branch
+          PATCHED_BRANCH="${VERSION}-patched"
+          git checkout -B "$PATCHED_BRANCH" "$VERSION"
+
+          # Cherry-pick the patch
+          if ! git cherry-pick "$PATCH_COMMIT"; then
+            echo "Failed to apply patch to $VERSION"
+            echo "The patch may not be compatible with this version"
+            git cherry-pick --abort || true
+            exit 1
+          fi
+
+          echo "Successfully patched $VERSION"
+
+          # Push patched branch
+          git push origin "$PATCHED_BRANCH" --force-with-lease
+
+          # Create and push tag
+          git tag "$PATCHED_TAG"
+          git push origin "$PATCHED_TAG"
+
+          echo "patched_version=$PATCHED_TAG" >> $GITHUB_OUTPUT
+
+  build-binaries:
+    needs: patch-and-build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+
+    steps:
+      - name: Checkout patched version
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.patch-and-build.outputs.patched_version }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION="${{ needs.patch-and-build.outputs.patched_version }}"
+
+          echo "Building for $GOOS/$GOARCH..."
+
+          # Build binaries based on OS
+          if [ "$GOOS" = "linux" ]; then
+            # Build both buildkitd and buildctl for Linux
+            go build -o bin/buildkitd ./cmd/buildkitd
+            go build -o bin/buildctl ./cmd/buildctl
+          else
+            # Only buildctl for macOS
+            go build -o bin/buildctl ./cmd/buildctl
+          fi
+
+          # Create tarball
+          cd bin
+          tar -czf "../buildkit-${VERSION}-${{ matrix.suffix }}.tar.gz" *
+          cd ..
+
+          # Show what was built
+          ls -la buildkit-*.tar.gz
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildkit-${{ needs.patch-and-build.outputs.patched_version }}-${{ matrix.suffix }}
+          path: buildkit-*.tar.gz
+
+  create-release:
+    needs: [patch-and-build, build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -name "*.tar.gz" -exec mv {} release/ \;
+          cd release
+          ls -la
+
+          # Generate checksums
+          sha256sum *.tar.gz > SHA256SUMS
+
+          # Show checksums
+          echo "Generated checksums:"
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.patch-and-build.outputs.patched_version }}
+          name: BuildKit ${{ github.event.inputs.upstream_version }} (Patched)
+          body: |
+            # BuildKit ${{ github.event.inputs.upstream_version }} - Patched Release
+
+            This is BuildKit ${{ github.event.inputs.upstream_version }} with production stability patches applied.
+
+            ## Patches Applied
+            - ✅ **history.db corruption recovery** - Prevents startup failures when history.db is corrupted
+
+            ## Download
+
+            ### Linux
+            ```bash
+            # AMD64
+            wget https://github.com/${{ github.repository }}/releases/download/${{ needs.patch-and-build.outputs.patched_version }}/buildkit-${{ needs.patch-and-build.outputs.patched_version }}-linux-amd64.tar.gz
+            tar -xzf buildkit-${{ needs.patch-and-build.outputs.patched_version }}-linux-amd64.tar.gz
+            sudo mv buildkitd buildctl /usr/local/bin/
+
+            # ARM64
+            wget https://github.com/${{ github.repository }}/releases/download/${{ needs.patch-and-build.outputs.patched_version }}/buildkit-${{ needs.patch-and-build.outputs.patched_version }}-linux-arm64.tar.gz
+            tar -xzf buildkit-${{ needs.patch-and-build.outputs.patched_version }}-linux-arm64.tar.gz
+            sudo mv buildkitd buildctl /usr/local/bin/
+            ```
+
+            ### macOS
+            ```bash
+            # Intel
+            wget https://github.com/${{ github.repository }}/releases/download/${{ needs.patch-and-build.outputs.patched_version }}/buildkit-${{ needs.patch-and-build.outputs.patched_version }}-darwin-amd64.tar.gz
+            tar -xzf buildkit-${{ needs.patch-and-build.outputs.patched_version }}-darwin-amd64.tar.gz
+            sudo mv buildctl /usr/local/bin/
+
+            # Apple Silicon
+            wget https://github.com/${{ github.repository }}/releases/download/${{ needs.patch-and-build.outputs.patched_version }}/buildkit-${{ needs.patch-and-build.outputs.patched_version }}-darwin-arm64.tar.gz
+            tar -xzf buildkit-${{ needs.patch-and-build.outputs.patched_version }}-darwin-arm64.tar.gz
+            sudo mv buildctl /usr/local/bin/
+            ```
+
+            ## Verify Checksums
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ needs.patch-and-build.outputs.patched_version }}/SHA256SUMS
+            sha256sum -c SHA256SUMS
+            ```
+
+            ## Source
+            - Upstream version: [${{ github.event.inputs.upstream_version }}](https://github.com/moby/buildkit/releases/tag/${{ github.event.inputs.upstream_version }})
+            - Patch branch: `${{ env.PATCH_BRANCH }}`
+            - Patched tag: `${{ needs.patch-and-build.outputs.patched_version }}`
+          files: |
+            release/*
+          draft: false
+          prerelease: false
