@@ -35,7 +35,7 @@ jobs:
       - name: Add and fetch upstream
         run: |
           git remote add upstream https://github.com/moby/buildkit.git || true
-          git fetch upstream --tags
+          git fetch upstream master --tags
           git fetch origin master
 
       - name: Verify upstream version exists
@@ -104,8 +104,7 @@ jobs:
             if git cherry-pick "$COMMIT" >/dev/null 2>&1; then
               echo "  ✅ Success"
               if [ -n "$APPLIED_PATCHES" ]; then
-                APPLIED_PATCHES="$APPLIED_PATCHES
-- $FULL_MSG"
+                APPLIED_PATCHES=$(printf "%s\n- %s" "$APPLIED_PATCHES" "$FULL_MSG")
               else
                 APPLIED_PATCHES="- $FULL_MSG"
               fi
@@ -113,8 +112,7 @@ jobs:
             else
               echo "  ❌ Failed (conflicts with this version)"
               if [ -n "$FAILED_PATCHES" ]; then
-                FAILED_PATCHES="$FAILED_PATCHES
-- $FULL_MSG"
+                FAILED_PATCHES=$(printf "%s\n- %s" "$FAILED_PATCHES" "$FULL_MSG")
               else
                 FAILED_PATCHES="- $FULL_MSG"
               fi
@@ -150,10 +148,7 @@ jobs:
           git push origin "$RELEASE_BRANCH"
 
           # Create annotated tag with patch list
-          TAG_MSG="Release $VERSION with $SUCCESS_COUNT patches
-
-Patches applied:
-$APPLIED_PATCHES"
+          TAG_MSG=$(printf "Release %s with %s patches\n\nPatches applied:\n%s" "$VERSION" "$SUCCESS_COUNT" "$APPLIED_PATCHES")
 
           git tag -a "$RELEASE_TAG" -m "$TAG_MSG"
           git push origin "$RELEASE_TAG"
