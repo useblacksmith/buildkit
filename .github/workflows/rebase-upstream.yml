@@ -6,6 +6,10 @@ on:
     # Run weekly on Mondays at 9am UTC
     - cron: '0 9 * * 1'
 
+permissions:
+  contents: write
+  issues: write
+
 jobs:
   rebase:
     runs-on: ubuntu-latest
