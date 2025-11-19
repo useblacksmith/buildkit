@@ -103,11 +103,21 @@ jobs:
             echo "Applying $COMMIT_MSG..."
             if git cherry-pick "$COMMIT" >/dev/null 2>&1; then
               echo "  ✅ Success"
-              APPLIED_PATCHES="${APPLIED_PATCHES}\n- ${FULL_MSG}"
+              if [ -n "$APPLIED_PATCHES" ]; then
+                APPLIED_PATCHES="$APPLIED_PATCHES
+- $FULL_MSG"
+              else
+                APPLIED_PATCHES="- $FULL_MSG"
+              fi
               SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
             else
               echo "  ❌ Failed (conflicts with this version)"
-              FAILED_PATCHES="${FAILED_PATCHES}\n- ${FULL_MSG}"
+              if [ -n "$FAILED_PATCHES" ]; then
+                FAILED_PATCHES="$FAILED_PATCHES
+- $FULL_MSG"
+              else
+                FAILED_PATCHES="- $FULL_MSG"
+              fi
               git cherry-pick --abort || true
             fi
           done
@@ -119,13 +129,13 @@ jobs:
           if [ -n "$APPLIED_PATCHES" ]; then
             echo ""
             echo "✅ Successfully applied:"
-            echo -e "$APPLIED_PATCHES"
+            echo "$APPLIED_PATCHES"
           fi
 
           if [ -n "$FAILED_PATCHES" ]; then
             echo ""
             echo "⚠️  Failed to apply (incompatible with $VERSION):"
-            echo -e "$FAILED_PATCHES"
+            echo "$FAILED_PATCHES"
           fi
 
           if [ "$SUCCESS_COUNT" -eq 0 ]; then
@@ -142,7 +152,8 @@ jobs:
           # Create annotated tag with patch list
           TAG_MSG="Release $VERSION with $SUCCESS_COUNT patches
 
-          Patches applied:$APPLIED_PATCHES"
+Patches applied:
+$APPLIED_PATCHES"
 
           git tag -a "$RELEASE_TAG" -m "$TAG_MSG"
           git push origin "$RELEASE_TAG"
