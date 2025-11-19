@@ -12,6 +12,9 @@ on:
         required: false
         type: string
         default: 'blacksmith'
+  # Temporary: for debugging authentication issues
+  pull_request:
+    branches: [master]
 
 permissions:
   contents: write
@@ -24,11 +27,30 @@ jobs:
       patch_count: ${{ steps.create-release-branch.outputs.patch_count }}
       patch_list: ${{ steps.create-release-branch.outputs.patch_list }}
     steps:
-      - name: Checkout repository
+      # Debug: Check if secret exists
+      - name: Debug - Check token availability
+        run: |
+          if [ -n "${{ secrets.WORKFLOW_TOKEN }}" ]; then
+            echo "✅ WORKFLOW_TOKEN secret is configured"
+          else
+            echo "❌ WORKFLOW_TOKEN secret is NOT configured or empty"
+          fi
+          echo "Event name: ${{ github.event_name }}"
+
+      # Try checkout with explicit token first
+      - name: Checkout repository with PAT
+        if: ${{ secrets.WORKFLOW_TOKEN != '' }}
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.WORKFLOW_TOKEN }}
+
+      # Fallback to default token if PAT fails or doesn't exist
+      - name: Checkout repository with default token
+        if: ${{ secrets.WORKFLOW_TOKEN == '' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup git
         run: |
@@ -43,20 +65,33 @@ jobs:
 
       - name: Verify upstream version exists
         run: |
-          if ! git rev-parse "refs/tags/${{ github.event.inputs.upstream_version }}" >/dev/null 2>&1; then
-            echo "❌ Upstream version ${{ github.event.inputs.upstream_version }} not found"
+          # For PR testing, check v0.26.1; for dispatch, check input version
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHECK_VERSION="v0.26.1"
+          else
+            CHECK_VERSION="${{ github.event.inputs.upstream_version }}"
+          fi
+
+          if ! git rev-parse "refs/tags/$CHECK_VERSION" >/dev/null 2>&1; then
+            echo "❌ Upstream version $CHECK_VERSION not found"
             echo ""
             echo "Available recent versions:"
             git tag -l 'v*.*.*' | grep -v '\-' | sort -rV | head -20
             exit 1
           fi
-          echo "✅ Found upstream version ${{ github.event.inputs.upstream_version }}"
+          echo "✅ Found upstream version $CHECK_VERSION"
 
       - name: Create patched release branch
         id: create-release-branch
         run: |
-          VERSION="${{ github.event.inputs.upstream_version }}"
-          SUFFIX="${{ github.event.inputs.release_suffix }}"
+          # For PR testing, use v0.26.1; for dispatch, use input
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            VERSION="v0.26.1"
+            SUFFIX="blacksmith-test"
+          else
+            VERSION="${{ github.event.inputs.upstream_version }}"
+            SUFFIX="${{ github.event.inputs.release_suffix }}"
+          fi
           RELEASE_TAG="${VERSION}-${SUFFIX}"
           RELEASE_BRANCH="${VERSION}-${SUFFIX}"
 
@@ -145,23 +180,29 @@ jobs:
             exit 1
           fi
 
-          # Push branch and tag
+          # Push branch and tag (skip during PR testing)
           echo ""
-          echo "Pushing branch and tag..."
-          if ! git push origin "$RELEASE_BRANCH"; then
-            echo "❌ Failed to push release branch $RELEASE_BRANCH"
-            exit 1
-          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "🔍 PR Testing mode - skipping push operations"
+            echo "Would push branch: $RELEASE_BRANCH"
+            echo "Would push tag: $RELEASE_TAG"
+          else
+            echo "Pushing branch and tag..."
+            if ! git push origin "$RELEASE_BRANCH"; then
+              echo "❌ Failed to push release branch $RELEASE_BRANCH"
+              exit 1
+            fi
 
-          # Create annotated tag with patch list
-          TAG_MSG=$(printf "Release %s with %s patches\n\nPatches applied:\n%s" "$VERSION" "$SUCCESS_COUNT" "$APPLIED_PATCHES")
+            # Create annotated tag with patch list
+            TAG_MSG=$(printf "Release %s with %s patches\n\nPatches applied:\n%s" "$VERSION" "$SUCCESS_COUNT" "$APPLIED_PATCHES")
 
-          git tag -a "$RELEASE_TAG" -m "$TAG_MSG"
+            git tag -a "$RELEASE_TAG" -m "$TAG_MSG"
 
-          if ! git push origin "$RELEASE_TAG"; then
-            echo "❌ Failed to push release tag $RELEASE_TAG"
-            echo "Note: Release branch $RELEASE_BRANCH was already pushed"
-            exit 1
+            if ! git push origin "$RELEASE_TAG"; then
+              echo "❌ Failed to push release tag $RELEASE_TAG"
+              echo "Note: Release branch $RELEASE_BRANCH was already pushed"
+              exit 1
+            fi
           fi
 
           echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
@@ -172,6 +213,8 @@ jobs:
 
   build-binaries:
     needs: create-patched-release
+    # Skip builds during PR testing
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -235,6 +278,8 @@ jobs:
 
   create-github-release:
     needs: [create-patched-release, build-binaries]
+    # Skip release creation during PR testing
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Download all binaries
