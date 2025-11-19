@@ -67,9 +67,10 @@ jobs:
             exit 1
           fi
 
-          # Checkout upstream version
+          # Checkout upstream version with a temp branch name to avoid conflicts
           echo "Creating release branch from $VERSION..."
-          git checkout -b "$RELEASE_BRANCH" "$VERSION"
+          TEMP_BRANCH="temp-${RELEASE_BRANCH}-$$"
+          git checkout -b "$TEMP_BRANCH" "$VERSION"
 
           # Find all commits that are in origin/master but not in upstream/master
           echo ""
@@ -150,10 +151,10 @@ jobs:
           TAG_MSG=$(printf "Release %s with %s patches\n\nPatches applied:\n%s" "$VERSION" "$SUCCESS_COUNT" "$APPLIED_PATCHES")
           git tag -a "$RELEASE_TAG" -m "$TAG_MSG"
 
-          # Push the tag directly - this will trigger buildkit.yml
+          # Push the tag explicitly using refs/tags/ to avoid ambiguity
           echo ""
           echo "Pushing release tag..."
-          if git push origin "$RELEASE_TAG"; then
+          if git push origin "refs/tags/$RELEASE_TAG"; then
             echo "✅ Successfully pushed tag: $RELEASE_TAG"
             echo ""
             echo "========================================="
@@ -181,10 +182,11 @@ jobs:
             echo "To push manually:"
             echo "  git clone https://github.com/${{ github.repository }}.git"
             echo "  cd buildkit"
-            echo "  git fetch origin $RELEASE_BRANCH:$RELEASE_BRANCH"
-            echo "  git checkout $RELEASE_BRANCH"
-            echo "  git tag -a $RELEASE_TAG -m \"$TAG_MSG\""
-            echo "  git push origin $RELEASE_TAG"
+            echo "  git fetch --all --tags"
+            echo "  # Delete any conflicting branch"
+            echo "  git push origin --delete $RELEASE_TAG 2>/dev/null || true"
+            echo "  # Push the tag explicitly"
+            echo "  git push origin refs/tags/$RELEASE_TAG"
             exit 1
           fi
 
