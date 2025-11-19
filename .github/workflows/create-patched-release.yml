@@ -1,7 +1,8 @@
-name: Prepare Patched Release
+name: Create Patched Release
 
-# This workflow prepares a patched release but DOES NOT push it
-# After review, you manually push the tag which triggers buildkit.yml
+# This workflow creates a patched release by:
+# 1. Cherry-picking patches onto an upstream tag
+# 2. Pushing the tag to trigger buildkit.yml
 
 on:
   workflow_dispatch:
@@ -20,7 +21,7 @@ permissions:
   contents: write
 
 jobs:
-  prepare-release:
+  create-release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -149,56 +150,43 @@ jobs:
           TAG_MSG=$(printf "Release %s with %s patches\n\nPatches applied:\n%s" "$VERSION" "$SUCCESS_COUNT" "$APPLIED_PATCHES")
           git tag -a "$RELEASE_TAG" -m "$TAG_MSG"
 
-          # Push branch and tag with -draft suffix for review
-          DRAFT_BRANCH="${RELEASE_BRANCH}-draft"
-          DRAFT_TAG="${RELEASE_TAG}-draft"
-
+          # Push the tag directly - this will trigger buildkit.yml
           echo ""
-          echo "Pushing draft branch and tag for review..."
-          git branch -m "$DRAFT_BRANCH"
-          git push origin "$DRAFT_BRANCH"
-
-          git tag -a "$DRAFT_TAG" -m "$TAG_MSG"
-          git push origin "$DRAFT_TAG"
-
-          echo ""
-          echo "========================================="
-          echo "📦 RELEASE PREPARED SUCCESSFULLY"
-          echo "========================================="
-          echo ""
-          echo "Draft branch pushed: $DRAFT_BRANCH"
-          echo "Draft tag pushed: $DRAFT_TAG"
-          echo ""
-          echo "Review at: https://github.com/${{ github.repository }}/tree/$DRAFT_BRANCH"
-          echo ""
-
-          if [ "$HAS_WORKFLOW_CHANGES" = true ]; then
-            echo "⚠️  WARNING: This release contains workflow file changes!"
+          echo "Pushing release tag..."
+          if git push origin "$RELEASE_TAG"; then
+            echo "✅ Successfully pushed tag: $RELEASE_TAG"
             echo ""
+            echo "========================================="
+            echo "📦 RELEASE CREATED SUCCESSFULLY"
+            echo "========================================="
+            echo ""
+            echo "Tag pushed: $RELEASE_TAG"
+            echo ""
+            echo "The buildkit.yml workflow will now:"
+            echo "- Build multi-platform binaries"
+            echo "- Create Docker images"
+            echo "- Publish a GitHub release"
+            echo ""
+            echo "Monitor progress at:"
+            echo "https://github.com/${{ github.repository }}/actions"
+            echo ""
+          else
+            echo "❌ Failed to push tag"
+            echo ""
+            if [ "$HAS_WORKFLOW_CHANGES" = true ]; then
+              echo "This might be because the release contains workflow file changes."
+              echo "You may need to push the tag manually with a PAT that has workflow permissions."
+            fi
+            echo ""
+            echo "To push manually:"
+            echo "  git clone https://github.com/${{ github.repository }}.git"
+            echo "  cd buildkit"
+            echo "  git fetch origin $RELEASE_BRANCH:$RELEASE_BRANCH"
+            echo "  git checkout $RELEASE_BRANCH"
+            echo "  git tag -a $RELEASE_TAG -m \"$TAG_MSG\""
+            echo "  git push origin $RELEASE_TAG"
+            exit 1
           fi
-
-          echo "To complete the release, run these commands locally:"
-          echo ""
-          echo "  # Clone and fetch the draft"
-          echo "  git clone https://github.com/${{ github.repository }}.git"
-          echo "  cd buildkit"
-          echo "  git fetch origin $DRAFT_BRANCH:$RELEASE_BRANCH"
-          echo "  git fetch origin $DRAFT_TAG"
-          echo ""
-          echo "  # Review the patches"
-          echo "  git checkout $RELEASE_BRANCH"
-          echo "  git log --oneline -10"
-          echo ""
-          echo "  # If everything looks good, create and push the final tag"
-          echo "  git tag -a $RELEASE_TAG -m \"$(git tag -l -n1000 $DRAFT_TAG | tail -n +2)\""
-          echo "  git push origin $RELEASE_TAG"
-          echo ""
-          echo "  # This will trigger buildkit.yml to build and release"
-          echo ""
-          echo "  # Cleanup draft artifacts (optional)"
-          echo "  git push origin --delete $DRAFT_BRANCH"
-          echo "  git push origin --delete $DRAFT_TAG"
-          echo ""
 
           # Save info for artifact
           cat > release-info.txt << EOF
