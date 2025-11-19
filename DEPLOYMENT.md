@@ -4,6 +4,16 @@
 
 This fork maintains patches on top of upstream BuildKit using a rebase workflow. Our `master` branch contains upstream BuildKit plus our custom patches rebased on top.
 
+## Setup Requirements
+
+If your patches modify workflow files (`.github/workflows/*.yml`), you need to create a Personal Access Token:
+
+1. Go to GitHub Settings > Developer settings > Personal access tokens
+2. Create a new token with `repo` and `workflow` scopes
+3. Add it as a secret named `WORKFLOW_TOKEN` in your repository settings
+
+Without this token, the workflows will fall back to using `GITHUB_TOKEN`, which cannot push workflow changes.
+
 ## Creating a Patched Release
 
 To deploy a patched version of BuildKit:
