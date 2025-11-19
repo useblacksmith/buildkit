@@ -18,22 +18,33 @@ gh workflow run prepare-patched-release.yml -f upstream_version=v0.17.0
 
 The workflow will:
 - Cherry-pick all your patches from master onto v0.17.0
-- Create a tag `v0.17.0-blacksmith`
+- Push a draft branch: `v0.17.0-blacksmith-draft`
+- Push a draft tag: `v0.17.0-blacksmith-draft`
 - Show which patches succeeded/failed
 - Provide exact commands to complete the release
 
-### Step 2: Push the Tag
+### Step 2: Review and Release
 
-After reviewing the workflow output, run locally:
+After the workflow completes, review and push the final tag:
 
 ```bash
-# Clone and fetch
+# Clone and fetch the draft
 git clone https://github.com/useblacksmith/buildkit.git
 cd buildkit
-git fetch --all --tags
+git fetch origin v0.17.0-blacksmith-draft:v0.17.0-blacksmith
+git fetch origin v0.17.0-blacksmith-draft
 
-# Push the tag - this triggers buildkit.yml
+# Review the patches
+git checkout v0.17.0-blacksmith
+git log --oneline -10
+
+# Create and push the final tag (this triggers buildkit.yml)
+git tag -a v0.17.0-blacksmith -m "$(git tag -l -n1000 v0.17.0-blacksmith-draft | tail -n +2)"
 git push origin v0.17.0-blacksmith
+
+# Cleanup draft artifacts (optional)
+git push origin --delete v0.17.0-blacksmith-draft
+git push origin --delete v0.17.0-blacksmith-draft
 ```
 
 The existing `buildkit.yml` workflow automatically:
