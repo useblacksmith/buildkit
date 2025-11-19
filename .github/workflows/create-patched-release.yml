@@ -1,0 +1,222 @@
+name: Create Patched Release
+
+# This workflow creates a patched release by:
+# 1. Cherry-picking patches onto an upstream tag
+# 2. Pushing the tag to trigger buildkit.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_version:
+        description: 'Upstream version to patch (e.g., v0.17.0)'
+        required: true
+        type: string
+      release_suffix:
+        description: 'Suffix for release (default: blacksmith)'
+        required: false
+        type: string
+        default: 'blacksmith'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream https://github.com/moby/buildkit.git || true
+          git fetch upstream master --tags
+          git fetch origin master
+
+      - name: Prepare patched release
+        id: prepare
+        run: |
+          VERSION="${{ github.event.inputs.upstream_version }}"
+          SUFFIX="${{ github.event.inputs.release_suffix }}"
+          RELEASE_TAG="${VERSION}-${SUFFIX}"
+          RELEASE_BRANCH="${VERSION}-${SUFFIX}"
+
+          # Check if already exists
+          if git rev-parse "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "❌ Release $RELEASE_TAG already exists"
+            echo ""
+            echo "To recreate it, first delete the existing tag:"
+            echo "  git push origin --delete $RELEASE_TAG"
+            echo "  git push origin --delete $RELEASE_BRANCH"
+            exit 1
+          fi
+
+          # Verify upstream version exists
+          if ! git rev-parse "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "❌ Upstream version $VERSION not found"
+            echo ""
+            echo "Available recent versions:"
+            git tag -l 'v*.*.*' | grep -v '\-' | sort -rV | head -20
+            exit 1
+          fi
+
+          # Checkout upstream version
+          echo "Creating release branch from $VERSION..."
+          git checkout -b "$RELEASE_BRANCH" "$VERSION"
+
+          # Find all commits that are in origin/master but not in upstream/master
+          echo ""
+          echo "Finding patches to apply..."
+          PATCHES=$(git rev-list upstream/master..origin/master --reverse --no-merges)
+
+          if [ -z "$PATCHES" ]; then
+            echo "⚠️  No patches found. Your master branch has no commits ahead of upstream."
+            exit 1
+          fi
+
+          # Count patches
+          PATCH_COUNT=$(echo "$PATCHES" | wc -l | tr -d ' ')
+          echo "Found $PATCH_COUNT patches to apply"
+          echo ""
+
+          # Apply patches and collect results
+          APPLIED_PATCHES=""
+          FAILED_PATCHES=""
+          SUCCESS_COUNT=0
+          HAS_WORKFLOW_CHANGES=false
+
+          for COMMIT in $PATCHES; do
+            COMMIT_MSG=$(git log -1 --pretty=format:"%h: %s" "$COMMIT")
+            FULL_MSG=$(git log -1 --pretty=format:"%s" "$COMMIT")
+
+            # Check if commit modifies workflow files
+            WORKFLOW_CHANGES=$(git diff-tree --no-commit-id --name-only -r "$COMMIT" | grep "^.github/workflows/" || true)
+            if [ -n "$WORKFLOW_CHANGES" ]; then
+              HAS_WORKFLOW_CHANGES=true
+              echo "⚠️  Commit $COMMIT_MSG modifies workflow files:"
+              echo "$WORKFLOW_CHANGES" | sed 's/^/    /'
+            fi
+
+            echo "Applying $COMMIT_MSG..."
+            if git cherry-pick "$COMMIT" >/dev/null 2>&1; then
+              echo "  ✅ Success"
+              if [ -n "$APPLIED_PATCHES" ]; then
+                APPLIED_PATCHES=$(printf "%s\n- %s" "$APPLIED_PATCHES" "$FULL_MSG")
+              else
+                APPLIED_PATCHES="- $FULL_MSG"
+              fi
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+              echo "  ❌ Failed (conflicts with this version)"
+              if [ -n "$FAILED_PATCHES" ]; then
+                FAILED_PATCHES=$(printf "%s\n- %s" "$FAILED_PATCHES" "$FULL_MSG")
+              else
+                FAILED_PATCHES="- $FULL_MSG"
+              fi
+              git cherry-pick --abort || true
+            fi
+          done
+
+          echo ""
+          echo "========================================="
+          echo "Applied $SUCCESS_COUNT out of $PATCH_COUNT patches"
+
+          if [ -n "$APPLIED_PATCHES" ]; then
+            echo ""
+            echo "✅ Successfully applied:"
+            echo "$APPLIED_PATCHES"
+          fi
+
+          if [ -n "$FAILED_PATCHES" ]; then
+            echo ""
+            echo "⚠️  Failed to apply (incompatible with $VERSION):"
+            echo "$FAILED_PATCHES"
+          fi
+
+          if [ "$SUCCESS_COUNT" -eq 0 ]; then
+            echo ""
+            echo "❌ No patches could be applied to $VERSION"
+            exit 1
+          fi
+
+          # Create annotated tag
+          TAG_MSG=$(printf "Release %s with %s patches\n\nPatches applied:\n%s" "$VERSION" "$SUCCESS_COUNT" "$APPLIED_PATCHES")
+          git tag -a "$RELEASE_TAG" -m "$TAG_MSG"
+
+          # Push the tag directly - this will trigger buildkit.yml
+          echo ""
+          echo "Pushing release tag..."
+          if git push origin "$RELEASE_TAG"; then
+            echo "✅ Successfully pushed tag: $RELEASE_TAG"
+            echo ""
+            echo "========================================="
+            echo "📦 RELEASE CREATED SUCCESSFULLY"
+            echo "========================================="
+            echo ""
+            echo "Tag pushed: $RELEASE_TAG"
+            echo ""
+            echo "The buildkit.yml workflow will now:"
+            echo "- Build multi-platform binaries"
+            echo "- Create Docker images"
+            echo "- Publish a GitHub release"
+            echo ""
+            echo "Monitor progress at:"
+            echo "https://github.com/${{ github.repository }}/actions"
+            echo ""
+          else
+            echo "❌ Failed to push tag"
+            echo ""
+            if [ "$HAS_WORKFLOW_CHANGES" = true ]; then
+              echo "This might be because the release contains workflow file changes."
+              echo "You may need to push the tag manually with a PAT that has workflow permissions."
+            fi
+            echo ""
+            echo "To push manually:"
+            echo "  git clone https://github.com/${{ github.repository }}.git"
+            echo "  cd buildkit"
+            echo "  git fetch origin $RELEASE_BRANCH:$RELEASE_BRANCH"
+            echo "  git checkout $RELEASE_BRANCH"
+            echo "  git tag -a $RELEASE_TAG -m \"$TAG_MSG\""
+            echo "  git push origin $RELEASE_TAG"
+            exit 1
+          fi
+
+          # Save info for artifact
+          cat > release-info.txt << EOF
+          RELEASE_TAG=$RELEASE_TAG
+          RELEASE_BRANCH=$RELEASE_BRANCH
+          VERSION=$VERSION
+          SUCCESS_COUNT=$SUCCESS_COUNT
+          HAS_WORKFLOW_CHANGES=$HAS_WORKFLOW_CHANGES
+
+          Commands to complete release:
+          git clone https://github.com/${{ github.repository }}.git
+          cd buildkit
+          git remote add upstream https://github.com/moby/buildkit.git
+          git fetch --all --tags
+          git push origin $RELEASE_TAG
+          git push origin $RELEASE_BRANCH
+          EOF
+
+      - name: Create patch summary
+        if: always()
+        run: |
+          if [ -f release-info.txt ]; then
+            echo "## Release Information"
+            cat release-info.txt
+          fi
+
+      - name: Upload release info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-info
+          path: release-info.txt
+          retention-days: 7

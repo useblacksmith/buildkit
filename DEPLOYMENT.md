@@ -2,63 +2,35 @@
 
 ## Overview
 
-This fork maintains patches on top of upstream BuildKit using a rebase workflow. Our `master` branch contains upstream BuildKit plus our custom patches rebased on top.
-
-## Setup Requirements
-
-**Required**: You must create a Personal Access Token for the workflows to function properly:
-
-1. Go to GitHub Settings > Developer settings > Personal access tokens > Tokens (classic)
-2. Click "Generate new token (classic)"
-3. Give it a descriptive name (e.g., "BuildKit Fork Workflow")
-4. Select these scopes:
-   - `repo` (all checkboxes under repo)
-   - `workflow` (update GitHub Action workflows)
-5. Generate the token and copy it
-6. Go to your fork's Settings > Secrets and variables > Actions
-7. Click "New repository secret"
-8. Name: `WORKFLOW_TOKEN`
-9. Value: Paste your Personal Access Token
-
-This token is necessary because:
-- The default `GITHUB_TOKEN` cannot push changes to workflow files
-- Some patches may include modifications to `.github/workflows/*.yml` files
+This fork maintains patches on top of upstream BuildKit. We use a single automated workflow to create releases.
 
 ## Creating a Patched Release
 
-To deploy a patched version of BuildKit:
+### One Command
 
 ```bash
-# Create release for v0.17.0 with all our patches
-gh workflow run release-patched-version.yml -f upstream_version=v0.17.0
+# Create a release based on upstream v0.17.0
+gh workflow run create-patched-release.yml -f upstream_version=v0.17.0
 ```
 
-This workflow:
-1. Finds all commits in `origin/master` that aren't in `upstream/master` (our patches)
-2. Cherry-picks each patch onto the upstream version tag
-3. Builds binaries for Linux and macOS (amd64/arm64)
-4. Creates a GitHub release with downloadable artifacts
+The workflow will:
+1. Cherry-pick all your patches from master onto v0.17.0
+2. Create and push tag `v0.17.0-blacksmith`
+3. Trigger `buildkit.yml` which automatically:
+   - Builds multi-platform binaries (Linux/macOS, amd64/arm64)
+   - Creates Docker images
+   - Publishes a GitHub release with artifacts
 
-The release will be tagged as `v0.17.0-blacksmith`.
+### Monitor Progress
 
-## Keeping Synced with Upstream
+After running the workflow, monitor the release at:
+- Actions: https://github.com/useblacksmith/buildkit/actions
+- Releases: https://github.com/useblacksmith/buildkit/releases
 
-Run weekly or monthly:
+## Manual Upstream Sync
 
-```bash
-gh workflow run rebase-upstream.yml
-```
+To keep your patches rebased on upstream:
 
-This rebases our patches on top of the latest upstream master. When upstream merges one of our patches, it automatically disappears from our stack during the rebase.
-
-## Manual Operations
-
-### See Current Patches
-```bash
-git log upstream/master..origin/master --oneline
-```
-
-### Manual Rebase
 ```bash
 git checkout master
 git fetch upstream
@@ -66,16 +38,19 @@ git rebase upstream/master
 git push origin master --force-with-lease
 ```
 
-### Download Released Binaries
+## Tips
+
+### See Your Patches
 ```bash
-# Linux AMD64
-curl -L https://github.com/useblacksmith/buildkit/releases/download/v0.17.0-blacksmith/buildkit-v0.17.0-blacksmith-linux-amd64.tar.gz | tar xz
-sudo mv buildkitd buildctl /usr/local/bin/
+# View all patches not in upstream
+git log upstream/master..origin/master --oneline
 ```
 
-## Adding New Patches
-
+### Add New Patches
 1. Create a feature branch from `master`
 2. Make changes and commit
 3. Open PR against `master`
-4. After merge, the patch will be automatically included in all future releases
+4. After merge, the patch will be included in future releases
+
+### Download Released Binaries
+Releases are available at: https://github.com/useblacksmith/buildkit/releases
