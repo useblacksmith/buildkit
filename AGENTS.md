@@ -43,6 +43,10 @@ gofmt -w .
 gofmt -w path/to/file.go
 ```
 
+## Code Style
+
+- **Comments**: Don't comment obvious code. Do add concise comments when the rationale (the "why") behind a decision isn't obvious from the code itself — e.g., non-obvious business rules, workarounds, performance trade-offs, or constraints that would require digging through history to understand
+
 ## Workflow Summary
 
 1. Create a branch from `master`
