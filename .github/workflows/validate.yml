@@ -25,7 +25,7 @@ env:
 
 jobs:
   prepare:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       includes: ${{ steps.matrix.outputs.includes }}
     steps:
