@@ -30,7 +30,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       fail-fast: false
       matrix:
@@ -83,7 +83,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022]
+        os: [blacksmith-4vcpu-windows-2025]
         worker:
           - containerd
         pkg:
@@ -108,7 +108,7 @@ jobs:
           - ./frontend/dockerfile#11-12
           - ./frontend/dockerfile#12-12
         include:
-          - os: windows-2022
+          - os: blacksmith-4vcpu-windows-2025
             worker: containerd
             pkg: ./...
             skip-integration-tests: 1
@@ -198,7 +198,7 @@ jobs:
         uses: crazy-max/ghaction-dump-context@v2
 
   test-freebsd-amd64:
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     needs:
       - build
     env:
