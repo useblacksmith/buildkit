@@ -130,7 +130,11 @@ func printTableRow(tw *tabwriter.Writer, di *client.UsageInfo) {
 	if di.Shared {
 		size += "*"
 	}
-	fmt.Fprintf(tw, "%-71s\t%-11v\t%s\t\n", id, !di.InUse, size)
+	lastAccessed := ""
+	if di.LastUsedAt != nil {
+		lastAccessed = di.LastUsedAt.Local().Format("2006-01-02 15:04:05")
+	}
+	fmt.Fprintf(tw, "%-71s\t%-11v\t%s\t%s\n", id, !di.InUse, size, lastAccessed)
 }
 
 func printSummary(tw *tabwriter.Writer, du []*client.UsageInfo) {
