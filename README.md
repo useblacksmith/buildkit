@@ -42,6 +42,7 @@ Join `#buildkit` channel on [Docker Community Slack](https://dockr.ly/comm-slack
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 
 - [Used by](#used-by)
 - [Quick start](#quick-start)
