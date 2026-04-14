@@ -118,7 +118,7 @@ func printTable(tw *tabwriter.Writer, du []*client.UsageInfo) {
 }
 
 func printTableHeader(tw *tabwriter.Writer) {
-	fmt.Fprintln(tw, "ID\tRECLAIMABLE\tSIZE\tLAST ACCESSED")
+	fmt.Fprintln(tw, "ID\tRECLAIMABLE\tSIZE\tLAST ACCESSED\tUSAGE COUNT")
 }
 
 func printTableRow(tw *tabwriter.Writer, di *client.UsageInfo) {
@@ -130,7 +130,11 @@ func printTableRow(tw *tabwriter.Writer, di *client.UsageInfo) {
 	if di.Shared {
 		size += "*"
 	}
-	fmt.Fprintf(tw, "%-71s\t%-11v\t%s\t\n", id, !di.InUse, size)
+	lastAccessed := ""
+	if di.LastUsedAt != nil {
+		lastAccessed = di.LastUsedAt.Local().Format("2006-01-02 15:04:05")
+	}
+	fmt.Fprintf(tw, "%-71s\t%-11v\t%s\t%s\t%d\n", id, !di.InUse, size, lastAccessed, di.UsageCount)
 }
 
 func printSummary(tw *tabwriter.Writer, du []*client.UsageInfo) {
