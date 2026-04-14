@@ -3,11 +3,15 @@ package dockerfile2llb
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
+	"github.com/moby/buildkit/frontend/dockerfile/linter"
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
 	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/util/appcontext"
+	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,7 +44,7 @@ ENV FOO bar
 COPY f1 f2 /sub/
 RUN ls -l
 `
-	_, _, _, _, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	_, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.NoError(t, err)
 
 	df = `FROM scratch AS foo
@@ -49,7 +53,7 @@ FROM foo
 COPY --from=foo f1 /
 COPY --from=0 f2 /
 	`
-	_, _, _, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.NoError(t, err)
 
 	df = `FROM scratch AS foo
@@ -58,14 +62,14 @@ FROM foo
 COPY --from=foo f1 /
 COPY --from=0 f2 /
 	`
-	_, _, _, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{
 		Config: dockerui.Config{
 			Target: "Foo",
 		},
 	})
 	require.NoError(t, err)
 
-	_, _, _, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{
 		Config: dockerui.Config{
 			Target: "nosuch",
 		},
@@ -75,21 +79,21 @@ COPY --from=0 f2 /
 	df = `FROM scratch
 	ADD http://github.com/moby/buildkit/blob/master/README.md /
 		`
-	_, _, _, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.NoError(t, err)
 
 	df = `FROM scratch
 	COPY http://github.com/moby/buildkit/blob/master/README.md /
 		`
-	_, _, _, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.EqualError(t, err, "source can't be a URL for COPY")
 
 	df = `FROM "" AS foo`
-	_, _, _, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.Error(t, err)
 
 	df = `FROM ${BLANK} AS foo`
-	_, _, _, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.Error(t, err)
 }
 
@@ -100,10 +104,10 @@ ENV FOO bar
 COPY f1 f2 /sub/
 RUN ls -l
 `
-	state, _, _, _, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	res, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.NoError(t, err)
 
-	_, err = state.Marshal(context.TODO())
+	_, err = res.State.Marshal(context.TODO())
 	require.NoError(t, err)
 }
 
@@ -196,12 +200,35 @@ func TestToEnvList(t *testing.T) {
 	assert.Equal(t, map[string]string{"key1": "val1", "key2": "v1"}, result)
 }
 
+func TestProxyEnvFromBuildArgsDeterministicOrder(t *testing.T) {
+	pe := proxyEnvFromBuildArgs(map[string]string{
+		"ALL_PROXY":  "all-upper",
+		"all_proxy":  "all-lower",
+		"HTTP_PROXY": "http-upper",
+		"http_proxy": "http-lower",
+		"NO_PROXY":   "no-proxy",
+	})
+	require.NotNil(t, pe)
+	require.Equal(t, &llb.ProxyEnv{
+		HTTPProxy: "http-lower",
+		NoProxy:   "no-proxy",
+		AllProxy:  "all-lower",
+	}, pe)
+}
+
+func TestProxyEnvFromBuildArgsNilWhenNoProxyArgs(t *testing.T) {
+	pe := proxyEnvFromBuildArgs(map[string]string{
+		"FOO": "bar",
+	})
+	require.Nil(t, pe)
+}
+
 func TestDockerfileCircularDependencies(t *testing.T) {
 	// single stage depends on itself
 	df := `FROM busybox AS stage0
 COPY --from=stage0 f1 /sub/
 `
-	_, _, _, _, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	_, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.EqualError(t, err, "circular dependency detected on stage: stage0")
 
 	// multiple stages with circular dependency
@@ -212,7 +239,7 @@ COPY --from=stage0 f2 /sub/
 FROM busybox AS stage2
 COPY --from=stage1 f2 /sub/
 `
-	_, _, _, _, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	_, err = Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.EqualError(t, err, "circular dependency detected on stage: stage0")
 }
 
@@ -224,9 +251,28 @@ RUN echo foo
 FROM foo AS bar
 RUN echo bar
 `
-	_, _, baseImg, _, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
+	res, err := Dockerfile2LLB(appcontext.Context(), []byte(df), ConvertOpt{})
 	require.NoError(t, err)
-	t.Logf("baseImg=%+v", baseImg)
-	assert.Equal(t, []digest.Digest{"sha256:2e112031b4b923a873c8b3d685d48037e4d5ccd967b658743d93a6e56c3064b9"}, baseImg.RootFS.DiffIDs)
-	assert.Equal(t, "2024-01-17 21:49:12 +0000 UTC", baseImg.Created.String())
+	t.Logf("baseImg=%+v", res.BaseImage)
+	assert.Equal(t, []digest.Digest{"sha256:2e112031b4b923a873c8b3d685d48037e4d5ccd967b658743d93a6e56c3064b9"}, res.BaseImage.RootFS.DiffIDs)
+	assert.Equal(t, "2024-01-17 21:49:12 +0000 UTC", res.BaseImage.Created.String())
+}
+
+func TestDispatchHealthcheckHistory(t *testing.T) {
+	hc := &instructions.HealthCheckCommand{
+		Health: &dockerspec.HealthcheckConfig{
+			Test:          []string{"bin", "-c", "exit 0"},
+			Interval:      1 * time.Second,
+			Timeout:       10 * time.Second,
+			StartPeriod:   3 * time.Second,
+			StartInterval: 100 * time.Millisecond,
+			Retries:       5,
+		},
+	}
+
+	d := &dispatchState{}
+	err := dispatchHealthcheck(d, hc, &linter.Linter{})
+	require.NoError(t, err)
+	want := `HEALTHCHECK {Test:[bin -c exit 0] Interval:1s Timeout:10s StartPeriod:3s StartInterval:100ms Retries:5}`
+	require.Equal(t, want, d.image.History[0].CreatedBy)
 }

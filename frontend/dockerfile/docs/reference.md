@@ -373,10 +373,16 @@ whitespace, like `${foo}_bar`.
 The `${variable_name}` syntax also supports a few of the standard `bash`
 modifiers as specified below:
 
-- `${variable:-word}` indicates that if `variable` is set then the result
-  will be that value. If `variable` is not set then `word` will be the result.
-- `${variable:+word}` indicates that if `variable` is set then `word` will be
-  the result, otherwise the result is the empty string.
+- `${variable:-word}` indicates that if `variable` is set and non-empty then
+  the result will be that value. If `variable` is unset or empty then `word`
+  will be the result.
+- `${variable-word}` indicates that if `variable` is set (even if empty) then
+  the result will be that value. If `variable` is unset then `word` will be
+  the result.
+- `${variable:+word}` indicates that if `variable` is set and non-empty then
+  `word` will be the result, otherwise the result is the empty string.
+- `${variable+word}` indicates that if `variable` is set (even if empty) then
+  `word` will be the result, otherwise the result is the empty string.
 
 The following variable replacements are supported in a pre-release version of
 Dockerfile syntax, when using the `# syntax=docker/dockerfile-upstream:master` syntax
@@ -621,6 +627,20 @@ The image can be any valid image.
   [`COPY --from=<name>`](#copy---from),
   and [`RUN --mount=type=bind,from=<name>`](#run---mounttypebind) instructions
   to refer to the image built in this stage.
+
+  Using a previous build stage as the base for a subsequent stage is a common
+  pattern for sharing a common base environment:
+
+  ```dockerfile
+  FROM ubuntu AS base
+  RUN apt-get update && apt-get install -y shared-tooling
+
+  FROM base AS dev
+  RUN apt-get install -y dev-tooling
+
+  FROM base AS prod
+  COPY --from=build /app /app
+  ```
 - The `tag` or `digest` values are optional. If you omit either of them, the
   builder assumes a `latest` tag by default. The builder returns an error if it
   can't find the `tag` value.
@@ -833,12 +853,13 @@ The supported mount types are:
 This mount type allows binding files or directories to the build container. A
 bind mount is read-only by default.
 
-| Option                             | Description                                                                                    |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `target`, `dst`, `destination`[^1] | Mount path.                                                                                    |
-| `source`                           | Source path in the `from`. Defaults to the root of the `from`.                                 |
-| `from`                             | Build stage, context, or image name for the root of the source. Defaults to the build context. |
-| `rw`,`readwrite`                   | Allow writes on the mount. Written data will be discarded.                                     |
+| Option                             | Description                                                                                                                                   |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `target`, `dst`, `destination`[^1] | Mount path.                                                                                                                                   |
+| `source`                           | Source path in the `from`. Defaults to the root of the `from`.                                                                                |
+| `from`                             | Build stage, context, or image name for the root of the source. Defaults to the build context.                                                |
+| `rw`,`readwrite`                   | Allow writes on the mount. Written data will be discarded after the `RUN` instruction completes and will not be committed to the image layer. |
+
 
 ### RUN --mount=type=cache
 
@@ -880,7 +901,7 @@ FROM ubuntu
 RUN rm -f /etc/apt/apt.conf.d/docker-clean; echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   --mount=type=cache,target=/var/lib/apt,sharing=locked \
-  apt update && apt-get --no-install-recommends install -y gcc
+  apt-get update && apt-get --no-install-recommends install -y gcc
 ```
 
 Apt needs exclusive access to its data, so the caches use the option
@@ -1144,6 +1165,13 @@ Labels included in base images (images in the `FROM` line) are inherited by
 your image. If a label already exists but with a different value, the
 most-recently-applied value overrides any previously-set value.
 
+In a multi-stage build, labels from intermediate stages are only present in
+the final image if the final stage is directly or indirectly based on them
+(via `FROM`). Labels from a stage that you only reference with
+`COPY --from` or `RUN --mount=from=` are not included in the output image.
+Labels from the base image specified in the final `FROM` instruction are
+always inherited.
+
 To view an image's labels, use the `docker image inspect` command. You can use
 the `--format` option to show just the labels;
 
@@ -1322,8 +1350,8 @@ The available `[OPTIONS]` are:
 | --------------------------------------- | -------------------------- |
 | [`--keep-git-dir`](#add---keep-git-dir) | 1.1                        |
 | [`--checksum`](#add---checksum)         | 1.6                        |
-| [`--chown`](#add---chown---chmod)       |                            |
-| [`--chmod`](#add---chown---chmod)       | 1.2                        |
+| [`--chmod`](#add---chmod)               | 1.2                        |
+| [`--chown`](#add---chown)               |                            |
 | [`--link`](#add---link)                 | 1.4                        |
 | [`--unpack`](#add---unpack)             | 1.17                       |
 | [`--exclude`](#add---exclude)           | 1.19                       |
@@ -1573,19 +1601,26 @@ ADD --keep-git-dir=true https://github.com/moby/buildkit.git#v0.10.1 /buildkit
 ADD [--checksum=<hash>] <src> ... <dir>
 ```
 
-The `--checksum` flag lets you verify the checksum of a remote resource. The
-checksum is formatted as `sha256:<hash>`. SHA-256 is the only supported hash
-algorithm.
+The `--checksum` flag lets you verify the checksum of a remote Git or HTTP
+resource:
+
+- For Git sources, the checksum is the commit SHA. It can be the full commit
+  SHA or match on the prefix (1 or more characters).
+- For HTTP sources, the checksum is the SHA-256 content digest, formatted as
+  `sha256:<hash>`. SHA-256 is the only supported hash algorithm.
 
 ```dockerfile
+ADD --checksum=be1f38e https://github.com/moby/buildkit.git#v0.26.2 /
 ADD --checksum=sha256:24454f830cdb571e2c4ad15481119c43b3cafd48dd869a9b2945d1036d1dc68d https://mirrors.edge.kernel.org/pub/linux/kernel/Historic/linux-0.01.tar.gz /
 ```
 
-The `--checksum` flag only supports HTTP(S) sources.
+### ADD --chmod
 
-### ADD --chown --chmod
+See [`COPY --chmod`](#copy---chmod).
 
-See [`COPY --chown --chmod`](#copy---chown---chmod).
+### ADD --chown
+
+See [`COPY --chown`](#copy---chown).
 
 ### ADD --link
 
@@ -1630,8 +1665,8 @@ The available `[OPTIONS]` are:
 | Option                             | Minimum Dockerfile version |
 | ---------------------------------- | -------------------------- |
 | [`--from`](#copy---from)           |                            |
-| [`--chown`](#copy---chown---chmod) |                            |
-| [`--chmod`](#copy---chown---chmod) | 1.2                        |
+| [`--chmod`](#copy---chmod)         | 1.2                        |
+| [`--chown`](#copy---chown)         |                            |
 | [`--link`](#copy---link)           | 1.4                        |
 | [`--parents`](#copy---parents)     | 1.20                       |
 | [`--exclude`](#copy---exclude)     | 1.19                       |
@@ -1801,32 +1836,52 @@ COPY --from=nginx:latest /etc/nginx/nginx.conf /nginx.conf
 The source path of `COPY --from` is always resolved from filesystem root of the
 image or stage that you specify.
 
-### COPY --chown --chmod
-
-> [!NOTE]
-> Only octal notation is currently supported. Non-octal support is tracked in
-> [moby/buildkit#1951](https://github.com/moby/buildkit/issues/1951).
+### COPY --chmod
 
 ```dockerfile
-COPY [--chown=<user>:<group>] [--chmod=<perms> ...] <src> ... <dest>
+COPY [--chmod=<perms>] <src> ... <dest>
 ```
 
-The `--chown` and `--chmod` features are only supported on Dockerfiles used to build Linux containers,
-and doesn't work on Windows containers. Since user and group ownership concepts do
-not translate between Linux and Windows, the use of `/etc/passwd` and `/etc/group` for
-translating user and group names to IDs restricts this feature to only be viable for
-Linux OS-based containers.
+The `--chmod` flag supports octal notation (e.g., `755`, `644`) and symbolic
+notation (e.g., `+x`, `g=u`). Symbolic notation (added in Dockerfile version 1.14)
+is useful when octal isn't flexible enough. For example, `u=rwX,go=rX` sets
+directories to 755 and files to 644, while preserving the executable bit on files
+that already have it. (Capital `X` means "executable only if it's a directory or
+already executable.")
 
-All files and directories copied from the build context are created with a UID and GID of `0` unless the
-optional `--chown` flag specifies a given username, groupname, or UID/GID
-combination to request specific ownership of the copied content. The
-format of the `--chown` flag allows for either username and groupname strings
-or direct integer UID and GID in any combination. Providing a username without
-groupname or a UID without GID will use the same numeric UID as the GID. If a
-username or groupname is provided, the container's root filesystem
-`/etc/passwd` and `/etc/group` files will be used to perform the translation
-from name to integer UID or GID respectively. The following examples show
-valid definitions for the `--chown` flag:
+For more information about symbolic notation syntax, see the
+[chmod(1) manual](https://man.freebsd.org/cgi/man.cgi?chmod).
+
+Examples using octal notation:
+
+```dockerfile
+COPY --chmod=755 app.sh /app/
+COPY --chmod=644 file.txt /data/
+ARG MODE=440
+COPY --chmod=$MODE . .
+```
+
+Examples using symbolic notation:
+
+```dockerfile
+COPY --chmod=+x script.sh /app/
+COPY --chmod=u=rwX,go=rX . /app/
+COPY --chmod=g=u config/ /config/
+```
+
+The `--chmod` flag is not supported when building Windows containers.
+
+### COPY --chown
+
+```dockerfile
+COPY [--chown=<user>:<group>] <src> ... <dest>
+```
+
+Sets ownership of copied files. Without this flag, files are created with UID
+and GID of 0.
+
+The flag accepts usernames, group names, UIDs, or GIDs in any combination.
+If you specify only a user, the GID is set to the same numeric value as the UID.
 
 ```dockerfile
 COPY --chown=55:mygroup files* /somedir/
@@ -1836,22 +1891,12 @@ COPY --chown=10:11 files* /somedir/
 COPY --chown=myuser:mygroup --chmod=644 files* /somedir/
 ```
 
-If the container root filesystem doesn't contain either `/etc/passwd` or
-`/etc/group` files and either user or group names are used in the `--chown`
-flag, the build will fail on the `COPY` operation. Using numeric IDs requires
-no lookup and does not depend on container root filesystem content.
+When using names instead of numeric IDs, BuildKit resolves them using
+`/etc/passwd` and `/etc/group` in the container's root filesystem. If these
+files are missing or don't contain the specified names, the build fails.
+Numeric IDs don't require this lookup.
 
-With the Dockerfile syntax version 1.10.0 and later,
-the `--chmod` flag supports variable interpolation,
-which lets you define the permission bits using build arguments:
-
-```dockerfile
-# syntax=docker/dockerfile:1.10
-FROM alpine
-WORKDIR /src
-ARG MODE=440
-COPY --chmod=$MODE . .
-```
+The `--chown` flag is not supported when building Windows containers.
 
 ### COPY --link
 
@@ -1965,6 +2010,26 @@ COPY --parents ./x/./y/*.txt /parents/
 # /parents/y/b.txt
 ```
 
+The `**` wildcard matches any number of path components, including none, and
+can be used to recursively match files across directory levels:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM scratch
+
+COPY --parents ./src/**/*.txt /parents/
+
+# Build context:
+# ./src/a.txt
+# ./src/x/b.txt
+# ./src/x/y/c.txt
+#
+# Output:
+# /parents/src/a.txt
+# /parents/src/x/b.txt
+# /parents/src/x/y/c.txt
+```
+
 Note that, without the `--parents` flag specified, any filename collision will
 fail the Linux `cp` operation with an explicit error message
 (`cp: will not overwrite just-created './x/a.txt' with './y/a.txt'`), where the
@@ -2043,8 +2108,8 @@ This allows arguments to be passed to the entry point, i.e., `docker run
 <image> -d` will pass the `-d` argument to the entry point. You can override
 the `ENTRYPOINT` instruction using the `docker run --entrypoint` flag.
 
-The shell form of `ENTRYPOINT` prevents any `CMD` command line arguments from
-being used. It also starts your `ENTRYPOINT` as a subcommand of `/bin/sh -c`,
+The shell form of `ENTRYPOINT` ignores any `CMD` or `docker run` command line
+arguments. It also starts your `ENTRYPOINT` as a subcommand of `/bin/sh -c`,
 which does not pass signals. This means that the executable will not be the
 container's `PID 1`, and will not receive Unix signals. In this case, your
 executable doesn't receive a `SIGTERM` from `docker stop <container>`.
@@ -2054,8 +2119,14 @@ Only the last `ENTRYPOINT` instruction in the Dockerfile will have an effect.
 ### Exec form ENTRYPOINT example
 
 You can use the exec form of `ENTRYPOINT` to set fairly stable default commands
-and arguments and then use either form of `CMD` to set additional defaults that
-are more likely to be changed.
+and arguments and then use `CMD` to set additional defaults that are more
+likely to be changed.
+
+When combining exec form `ENTRYPOINT` with `CMD`, use the exec form of `CMD`
+as well. Using the shell form of `CMD` causes it to be wrapped in
+`/bin/sh -c`, which means the `ENTRYPOINT` receives a shell invocation as its
+argument rather than the bare command and parameters. See
+[Understand how CMD and ENTRYPOINT interact](#understand-how-cmd-and-entrypoint-interact).
 
 ```dockerfile
 FROM ubuntu
@@ -2359,7 +2430,7 @@ USER <UID>[:<GID>]
 The `USER` instruction sets the user name (or UID) and optionally the user
 group (or GID) to use as the default user and group for the remainder of the
 current stage. The specified user is used for `RUN` instructions and at
-runtime, runs the relevant `ENTRYPOINT` and `CMD` commands.
+runtime runs the relevant `ENTRYPOINT` and `CMD` commands.
 
 > Note that when specifying a group for the user, the user will have _only_ the
 > specified group membership. Any other configured group memberships will be ignored.
@@ -2427,9 +2498,15 @@ Therefore, to avoid unintended operations in unknown directories, it's best prac
 ARG <name>[=<default value>] [<name>[=<default value>]...]
 ```
 
-The `ARG` instruction defines a variable that users can pass at build-time to
+The `ARG` instruction defines a variable that users can pass at build time to
 the builder with the `docker build` command using the `--build-arg <varname>=<value>`
-flag.
+flag. This variable can be used in subsequent instructions such as `FROM`, `ENV`,
+`WORKDIR`, and others using the `${VAR}` or `$VAR` template syntax.
+It is also passed to all subsequent `RUN` instructions as a build-time
+environment variable.
+
+Unlike `ENV`, an `ARG` variable is not embedded in the image and is not available
+in the final container.
 
 > [!WARNING]
 > It isn't recommended to use build arguments for passing secrets such as
@@ -2638,17 +2715,16 @@ RUN echo "I'm building for $TARGETPLATFORM"
 
 ### BuildKit built-in build args
 
-| Arg                              | Type   | Description                                                                                                                                                                                                      |
-|----------------------------------|--------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `BUILDKIT_BUILD_NAME`            | String | Override the build name shown in [`buildx history` command](https://docs.docker.com/reference/cli/docker/buildx/history/) and [Docker Desktop Builds view](https://docs.docker.com/desktop/use-desktop/builds/). |
-| `BUILDKIT_CACHE_MOUNT_NS`        | String | Set optional cache ID namespace.                                                                                                                                                                                 |
-| `BUILDKIT_CONTEXT_KEEP_GIT_DIR`  | Bool   | Trigger Git context to keep the `.git` directory.                                                                                                                                                                |
-| `BUILDKIT_HISTORY_PROVENANCE_V1` | Bool   | Enable [SLSA Provenance v1](https://slsa.dev/spec/v1.1/provenance) for build history record.                                                                                                                     |
-| `BUILDKIT_INLINE_CACHE`[^2]      | Bool   | Inline cache metadata to image config or not.                                                                                                                                                                    |
-| `BUILDKIT_MULTI_PLATFORM`        | Bool   | Opt into deterministic output regardless of multi-platform output or not.                                                                                                                                        |
-| `BUILDKIT_SANDBOX_HOSTNAME`      | String | Set the hostname (default `buildkitsandbox`)                                                                                                                                                                     |
-| `BUILDKIT_SYNTAX`                | String | Set frontend image                                                                                                                                                                                               |
-| `SOURCE_DATE_EPOCH`              | Int    | Set the Unix timestamp for created image and layers. More info from [reproducible builds](https://reproducible-builds.org/docs/source-date-epoch/). Supported since Dockerfile 1.5, BuildKit 0.11                |
+| Arg                             | Type   | Description                                                                                                                                                                                                      |
+|---------------------------------|--------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `BUILDKIT_BUILD_NAME`           | String | Override the build name shown in [`buildx history` command](https://docs.docker.com/reference/cli/docker/buildx/history/) and [Docker Desktop Builds view](https://docs.docker.com/desktop/use-desktop/builds/). |
+| `BUILDKIT_CACHE_MOUNT_NS`       | String | Set optional cache ID namespace.                                                                                                                                                                                 |
+| `BUILDKIT_CONTEXT_KEEP_GIT_DIR` | Bool   | Trigger Git context to keep the `.git` directory.                                                                                                                                                                |
+| `BUILDKIT_INLINE_CACHE`[^2]     | Bool   | Inline cache metadata to image config or not.                                                                                                                                                                    |
+| `BUILDKIT_MULTI_PLATFORM`       | Bool   | Opt into deterministic output regardless of multi-platform output or not.                                                                                                                                        |
+| `BUILDKIT_SANDBOX_HOSTNAME`     | String | Set the hostname (default `buildkitsandbox`)                                                                                                                                                                     |
+| `BUILDKIT_SYNTAX`               | String | Set frontend image. Set to `dockerfile.v0` to ignore the Dockerfile `# syntax=` directive and use the built-in frontend instead.                                                                                 |
+| `SOURCE_DATE_EPOCH`             | Int    | Set the Unix timestamp for created image and layers. More info from [reproducible builds](https://reproducible-builds.org/docs/source-date-epoch/). Supported since Dockerfile 1.5, BuildKit 0.11                |
 
 #### Example: keep `.git` dir
 
@@ -2814,6 +2890,11 @@ for instance `SIGKILL`, or an unsigned number that matches a position in the
 kernel's syscall table, for instance `9`. The default is `SIGTERM` if not
 defined.
 
+`STOPSIGNAL` applies to the signal sent by `docker stop` (and by the Docker
+daemon when stopping a container). It does not affect signals sent by keyboard
+shortcuts such as Ctrl+C, which sends `SIGINT` directly to the process
+regardless of the `STOPSIGNAL` setting.
+
 The image's default stopsignal can be overridden per container, using the
 `--stop-signal` flag on `docker run` and `docker create`.
 
@@ -2844,6 +2925,8 @@ The options that can appear before `CMD` are:
 
 The health check will first run **interval** seconds after the container is
 started, and then again **interval** seconds after each previous check completes.
+During the **start period**, health checks run at **start interval** frequency
+instead.
 
 If a single run of the check takes longer than **timeout** seconds then the check
 is considered to have failed. The process performing the check is abruptly stopped

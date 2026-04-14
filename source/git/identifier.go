@@ -1,8 +1,6 @@
 package git
 
 import (
-	"path"
-
 	"github.com/moby/buildkit/solver/llbsolver/provenance"
 	provenancetypes "github.com/moby/buildkit/solver/llbsolver/provenance/types"
 	"github.com/moby/buildkit/source"
@@ -21,6 +19,7 @@ type GitIdentifier struct {
 	MountSSHSock     string
 	KnownSSHHosts    string
 	SkipSubmodules   bool
+	MTime            string // "checkout" (default) or "commit"
 
 	VerifySignature *GitSignatureVerifyOptions
 }
@@ -45,9 +44,6 @@ func NewGitIdentifier(remoteURL string) (*GitIdentifier, error) {
 	if u.Opts != nil {
 		repo.Ref = u.Opts.Ref
 		repo.Subdir = u.Opts.Subdir
-	}
-	if sd := path.Clean(repo.Subdir); sd == "/" || sd == "." {
-		repo.Subdir = ""
 	}
 	return &repo, nil
 }

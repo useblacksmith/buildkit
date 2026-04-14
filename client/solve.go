@@ -25,6 +25,7 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	spb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/moby/buildkit/util/bklog"
+	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil"
@@ -36,7 +37,6 @@ import (
 type SolveOpt struct {
 	Exports               []ExportEntry
 	EnableSessionExporter bool
-	LocalDirs             map[string]string // Deprecated: use LocalMounts
 	LocalMounts           map[string]fsutil.FS
 	OCIStores             map[string]content.Store
 	SharedKey             string
@@ -94,11 +94,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 		return nil, errors.New("invalid with def and cb")
 	}
 
-	mounts, err := prepareMounts(&opt)
-	if err != nil {
-		return nil, err
-	}
-	syncedDirs, err := prepareSyncedFiles(def, mounts)
+	syncedDirs, err := prepareSyncedFiles(def, opt.LocalMounts)
 	if err != nil {
 		return nil, err
 	}
@@ -236,6 +232,9 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 	frontendAttrs := maps.Clone(opt.FrontendAttrs)
 	maps.Copy(frontendAttrs, cacheOpt.frontendAttrs)
 
+	const statusInactivityTimeout = 5 * time.Second
+	statusActivity := make(chan struct{}, 1)
+
 	solveCtx, cancelSolve := context.WithCancelCause(ctx)
 	var res *SolveResponse
 	eg.Go(func() error {
@@ -244,8 +243,21 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 
 		defer func() { // make sure the Status ends cleanly on build errors
 			go func() {
-				<-time.After(3 * time.Second)
-				cancelStatus(errors.WithStack(context.Canceled))
+				// Start inactivity monitoring after solve completes
+				statusInactivityTimer := time.NewTimer(statusInactivityTimeout)
+				defer statusInactivityTimer.Stop()
+				for {
+					select {
+					case <-statusContext.Done():
+						return
+					case <-statusActivity:
+						// Reset timer on activity
+						statusInactivityTimer.Reset(statusInactivityTimeout)
+					case <-statusInactivityTimer.C:
+						cancelStatus(errors.WithStack(context.Canceled))
+						return
+					}
+				}
 			}()
 			if !opt.SessionPreInitialized {
 				bklog.G(ctx).Debugf("stopping session")
@@ -345,7 +357,16 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 				if errors.Is(err, io.EOF) {
 					return nil
 				}
+				// Ignore context canceled, triggered after inactivity timeout
+				if errors.Is(err, context.Canceled) || statusContext.Err() != nil {
+					return nil
+				}
 				return errors.Wrap(err, "failed to receive status")
+			}
+			// Signal activity (non-blocking)
+			select {
+			case statusActivity <- struct{}{}:
+			default:
 			}
 			if statusChan != nil {
 				statusChan <- NewSolveStatus(resp)
@@ -500,25 +521,32 @@ func parseCacheOptions(ctx context.Context, isGateway bool, opt SolveOpt) (*cach
 				bklog.G(ctx).Warning("local cache import at " + csDir + " not found due to err: " + err.Error())
 				continue
 			}
+			dgst := im.Attrs["digest"]
 			// if digest is not specified, attempt to load from tag
-			if im.Attrs["digest"] == "" {
+			if dgst == "" {
 				tag := "latest"
 				if t, ok := im.Attrs["tag"]; ok {
 					tag = t
+				}
+				if tag == "" {
+					return nil, errors.New("local cache importer requires either explicit digest, \"latest\" tag or custom tag on index.json")
 				}
 
 				idx := ociindex.NewStoreIndex(csDir)
 				desc, err := idx.Get(tag)
 				if err != nil {
-					bklog.G(ctx).Warning("local cache import at " + csDir + " not found due to err: " + err.Error())
+					bklog.G(ctx).Warning("local cache import at " + csDir + " skipped due to err: " + err.Error())
 					continue
 				}
-				if desc != nil {
-					im.Attrs["digest"] = desc.Digest.String()
+				if desc == nil {
+					bklog.G(ctx).Warning("local cache import at " + csDir + " skipped: no digest found for tag " + tag)
+					continue
 				}
+				im.Attrs["digest"] = desc.Digest.String()
 			}
-			if im.Attrs["digest"] == "" {
-				return nil, errors.New("local cache importer requires either explicit digest, \"latest\" tag or custom tag on index.json")
+			if _, err := cs.Info(ctx, digest.Digest(im.Attrs["digest"])); err != nil {
+				bklog.G(ctx).Warning("local cache import at " + csDir + " skipped: digest " + im.Attrs["digest"] + " unavailable: " + err.Error())
+				continue
 			}
 			contentStores["local:"+csDir] = cs
 		}
@@ -552,21 +580,4 @@ func parseCacheOptions(ctx context.Context, isGateway bool, opt SolveOpt) (*cach
 		frontendAttrs:  frontendAttrs,
 	}
 	return &res, nil
-}
-
-func prepareMounts(opt *SolveOpt) (map[string]fsutil.FS, error) {
-	// merge local mounts and fallback local directories together
-	mounts := make(map[string]fsutil.FS)
-	maps.Copy(mounts, opt.LocalMounts)
-	for k, dir := range opt.LocalDirs {
-		mount, err := fsutil.NewFS(dir)
-		if err != nil {
-			return nil, err
-		}
-		if _, ok := mounts[k]; ok {
-			return nil, errors.Errorf("local mount %s already exists", k)
-		}
-		mounts[k] = mount
-	}
-	return mounts, nil
 }

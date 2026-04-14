@@ -15,6 +15,7 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/source/containerimage"
+	"github.com/moby/buildkit/util/iohelper"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/pkg/errors"
@@ -95,8 +96,8 @@ func TestWorkerExec(t *testing.T, w *base.Worker) {
 			Env:  []string{"PATH=/bin:/usr/bin:/sbin:/usr/sbin"},
 		},
 		Stdin:  pipeR,
-		Stdout: &nopCloser{stdout},
-		Stderr: &nopCloser{stderr},
+		Stdout: &iohelper.NopWriteCloser{Writer: stdout},
+		Stderr: &iohelper.NopWriteCloser{Writer: stderr},
 	}, started)
 	cancelTimeout()
 	t.Logf("Stdout: %s", stdout.String())
@@ -106,10 +107,11 @@ func TestWorkerExec(t *testing.T, w *base.Worker) {
 	require.Empty(t, stderr.String())
 
 	// first start pid1 in the background
+	execID := identity.NewID()
 	eg := errgroup.Group{}
 	started = make(chan struct{})
 	eg.Go(func() error {
-		_, err := w.WorkerOpt.Executor.Run(ctx, id, execMount(root), nil, executor.ProcessInfo{
+		_, err := w.WorkerOpt.Executor.Run(ctx, execID, execMount(root), nil, executor.ProcessInfo{
 			Meta: executor.Meta{
 				Args: []string{"sleep", "10"},
 				Cwd:  "/",
@@ -129,12 +131,12 @@ func TestWorkerExec(t *testing.T, w *base.Worker) {
 	stderr.Reset()
 
 	// verify pid1 is the sleep command via Exec
-	err = w.WorkerOpt.Executor.Exec(ctx, id, executor.ProcessInfo{
+	err = w.WorkerOpt.Executor.Exec(ctx, execID, executor.ProcessInfo{
 		Meta: executor.Meta{
 			Args: []string{"ps", "-o", "pid,comm"},
 		},
-		Stdout: &nopCloser{stdout},
-		Stderr: &nopCloser{stderr},
+		Stdout: &iohelper.NopWriteCloser{Writer: stdout},
+		Stderr: &iohelper.NopWriteCloser{Writer: stderr},
 	})
 	t.Logf("Stdout: %s", stdout.String())
 	t.Logf("Stderr: %s", stderr.String())
@@ -147,13 +149,13 @@ func TestWorkerExec(t *testing.T, w *base.Worker) {
 	stdin := bytes.NewReader([]byte("hello"))
 	stdout.Reset()
 	stderr.Reset()
-	err = w.WorkerOpt.Executor.Exec(ctx, id, executor.ProcessInfo{
+	err = w.WorkerOpt.Executor.Exec(ctx, execID, executor.ProcessInfo{
 		Meta: executor.Meta{
 			Args: []string{"sh", "-c", "cat > /tmp/msg"},
 		},
 		Stdin:  io.NopCloser(stdin),
-		Stdout: &nopCloser{stdout},
-		Stderr: &nopCloser{stderr},
+		Stdout: &iohelper.NopWriteCloser{Writer: stdout},
+		Stderr: &iohelper.NopWriteCloser{Writer: stderr},
 	})
 	require.NoError(t, err)
 	require.Empty(t, stdout.String())
@@ -162,12 +164,12 @@ func TestWorkerExec(t *testing.T, w *base.Worker) {
 	// verify contents of /tmp/msg
 	stdout.Reset()
 	stderr.Reset()
-	err = w.WorkerOpt.Executor.Exec(ctx, id, executor.ProcessInfo{
+	err = w.WorkerOpt.Executor.Exec(ctx, execID, executor.ProcessInfo{
 		Meta: executor.Meta{
 			Args: []string{"cat", "/tmp/msg"},
 		},
-		Stdout: &nopCloser{stdout},
-		Stderr: &nopCloser{stderr},
+		Stdout: &iohelper.NopWriteCloser{Writer: stdout},
+		Stderr: &iohelper.NopWriteCloser{Writer: stderr},
 	})
 	t.Logf("Stdout: %s", stdout.String())
 	t.Logf("Stderr: %s", stderr.String())
@@ -331,14 +333,6 @@ func TestWorkerCancel(t *testing.T, w *base.Worker) {
 	pid1Cancel(errors.WithStack(context.Canceled))
 	<-pid1Done
 	require.Contains(t, pid1Err.Error(), "exit code: 137", "pid1 exits with sigkill")
-}
-
-type nopCloser struct {
-	io.Writer
-}
-
-func (n *nopCloser) Close() error {
-	return nil
 }
 
 func execMount(m cache.Mountable) executor.Mount {

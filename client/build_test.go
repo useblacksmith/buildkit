@@ -5,25 +5,33 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/client/llb/sourceresolver"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	gatewayapi "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
+	sessionauth "github.com/moby/buildkit/session/auth"
 	"github.com/moby/buildkit/session/secrets/secretsprovider"
 	"github.com/moby/buildkit/session/sshforward/sshprovider"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/grpcerrors"
+	"github.com/moby/buildkit/util/iohelper"
 	utilsystem "github.com/moby/buildkit/util/system"
 	"github.com/moby/buildkit/util/testutil/echoserver"
 	"github.com/moby/buildkit/util/testutil/integration"
@@ -32,6 +40,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tonistiigi/fsutil"
 	"golang.org/x/crypto/ssh/agent"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 )
 
@@ -60,6 +69,7 @@ func TestClientGatewayIntegration(t *testing.T) {
 		testClientGatewayContainerExtraHosts,
 		testClientGatewayContainerSignal,
 		testWarnings,
+		testClientGatewayCanceledCredentialsCallbackReturns,
 		testClientGatewayNilResult,
 		testClientGatewayEmptyImageExec,
 	), integration.WithMirroredImages(integration.OfficialImages("busybox:latest")))
@@ -174,7 +184,7 @@ func testWarnings(t *testing.T, sb integration.Sandbox) {
 	product := "buildkit_test"
 
 	b := func(ctx context.Context, c client.Client) (*client.Result, error) {
-		st := llb.Scratch().File(llb.Mkfile("/dummy", 0600, []byte("foo")))
+		st := llb.Scratch().File(llb.Mkfile("/dummy", 0o600, []byte("foo")))
 
 		def, err := st.Marshal(ctx)
 		if err != nil {
@@ -488,7 +498,7 @@ func testClientGatewayContainerExecPipe(t *testing.T, sb integration.Sandbox) {
 
 		pid4, err := ctr.Start(ctx, client.StartRequest{
 			Args:   []string{"cat", "/tmp/test"},
-			Stdout: &nopCloser{output},
+			Stdout: &iohelper.NopWriteCloser{Writer: output},
 		})
 		if err != nil {
 			return nil, err
@@ -660,7 +670,7 @@ func testClientGatewayContainerMounts(t *testing.T, sb integration.Sandbox) {
 
 	tmpdir := integration.Tmpdir(t)
 
-	err = os.WriteFile(filepath.Join(tmpdir.Name, "local-file"), []byte("local"), 0644)
+	err = os.WriteFile(filepath.Join(tmpdir.Name, "local-file"), []byte("local"), 0o644)
 	require.NoError(t, err)
 
 	a := agent.NewKeyring()
@@ -690,31 +700,51 @@ func testClientGatewayContainerMounts(t *testing.T, sb integration.Sandbox) {
 			// TODO How do we get a results.Ref for a cache mount, tmpfs mount
 		}
 
-		containerMounts := []client.Mount{{
-			Dest:      "/cached",
-			MountType: pb.MountType_CACHE,
-			CacheOpt: &pb.CacheOpt{
-				ID:      t.Name(),
-				Sharing: pb.CacheSharingOpt_SHARED,
+		containerMounts := []client.Mount{
+			{
+				Dest:      "/",
+				MountType: pb.MountType_BIND,
 			},
-		}, {
-			Dest:      "/tmpfs",
-			MountType: pb.MountType_TMPFS,
-		}, {
-			Dest:      "/run/secrets/mysecret",
-			MountType: pb.MountType_SECRET,
-			SecretOpt: &pb.SecretOpt{
-				ID: "/run/secrets/mysecret",
+			{
+				Dest:      "/foo",
+				MountType: pb.MountType_BIND,
 			},
-		}, {
-			Dest:      sockPath,
-			MountType: pb.MountType_SSH,
-			SSHOpt: &pb.SSHOpt{
-				ID: t.Name(),
+			{
+				Dest:      "/local",
+				MountType: pb.MountType_BIND,
 			},
-		}}
+			{
+				Dest:      "/cached",
+				MountType: pb.MountType_CACHE,
+				CacheOpt: &pb.CacheOpt{
+					ID:      t.Name(),
+					Sharing: pb.CacheSharingOpt_SHARED,
+				},
+			},
+			{
+				Dest:      "/tmpfs",
+				MountType: pb.MountType_TMPFS,
+			},
+			{
+				Dest:      "/run/secrets/mysecret",
+				MountType: pb.MountType_SECRET,
+				SecretOpt: &pb.SecretOpt{
+					ID: "/run/secrets/mysecret",
+				},
+			},
+			{
+				Dest:      sockPath,
+				MountType: pb.MountType_SSH,
+				SSHOpt: &pb.SSHOpt{
+					ID: t.Name(),
+				},
+			},
+		}
 
-		for mountpoint, st := range mounts {
+		// Fill in mount references.
+		for i, m := range containerMounts {
+			st := mounts[m.Dest]
+
 			def, err := st.Marshal(ctx)
 			if err != nil {
 				return nil, errors.Wrap(err, "failed to marshal state")
@@ -726,11 +756,7 @@ func testClientGatewayContainerMounts(t *testing.T, sb integration.Sandbox) {
 			if err != nil {
 				return nil, errors.Wrap(err, "failed to solve")
 			}
-			containerMounts = append(containerMounts, client.Mount{
-				Dest:      mountpoint,
-				MountType: pb.MountType_BIND,
-				Ref:       r.Ref,
-			})
+			containerMounts[i].Ref = r.Ref
 		}
 
 		ctr, err := c.NewContainer(ctx, client.NewContainerRequest{Mounts: containerMounts})
@@ -744,6 +770,43 @@ func testClientGatewayContainerMounts(t *testing.T, sb integration.Sandbox) {
 		})
 		require.NoError(t, err)
 		defer pid1.Wait()
+
+		files := []struct {
+			index int
+			path  string
+			data  []byte
+		}{
+			{0, "/root-file", []byte(nil)},
+			{1, "/foo-file", []byte(nil)},
+			{2, "/local-file", []byte(`local`)},
+			{3, "/cache-file", []byte(nil)},
+		}
+		for _, file := range files {
+			cpath := containerMounts[file.index].Dest + file.path
+			pid, err := ctr.Start(ctx, client.StartRequest{
+				Args: []string{"test", "-f", cpath},
+			})
+			require.NoError(t, err, "cannot start container to check for file: %s", cpath)
+			err = pid.Wait()
+			require.NoError(t, err, "process for checking file failed: %s", cpath)
+
+			_, err = ctr.StatFile(ctx, client.StatContainerRequest{
+				StatRequest: client.StatRequest{
+					Path: file.path,
+				},
+				MountIndex: file.index,
+			})
+			require.NoError(t, err, "stat file for %q on mount %d failed", file.path, file.index)
+
+			b, err := ctr.ReadFile(ctx, client.ReadContainerRequest{
+				ReadRequest: client.ReadRequest{
+					Filename: file.path,
+				},
+				MountIndex: file.index,
+			})
+			require.NoError(t, err, "read file for %q on mount %d failed", file.path, file.index)
+			require.Equal(t, file.data, b)
+		}
 
 		pid, err := ctr.Start(ctx, client.StartRequest{
 			Args: []string{"test", "-f", "/root-file"},
@@ -783,7 +846,7 @@ func testClientGatewayContainerMounts(t *testing.T, sb integration.Sandbox) {
 		secretOutput := bytes.NewBuffer(nil)
 		pid, err = ctr.Start(ctx, client.StartRequest{
 			Args:   []string{"cat", "/run/secrets/mysecret"},
-			Stdout: &nopCloser{secretOutput},
+			Stdout: &iohelper.NopWriteCloser{Writer: secretOutput},
 		})
 		require.NoError(t, err)
 		err = pid.Wait()
@@ -934,8 +997,8 @@ func testClientGatewayContainerPID1Tty(t *testing.T, sb integration.Sandbox) {
 			Args:   []string{"sh"},
 			Tty:    true,
 			Stdin:  inputR,
-			Stdout: &nopCloser{output},
-			Stderr: &nopCloser{output},
+			Stdout: &iohelper.NopWriteCloser{Writer: output},
+			Stderr: &iohelper.NopWriteCloser{Writer: output},
 			Env:    []string{fmt.Sprintf("PS1=%s", prompt.String())},
 		})
 		require.NoError(t, err)
@@ -1016,8 +1079,8 @@ func testClientGatewayContainerCancelPID1Tty(t *testing.T, sb integration.Sandbo
 			Args:   []string{"sh"},
 			Tty:    true,
 			Stdin:  inputR,
-			Stdout: &nopCloser{output},
-			Stderr: &nopCloser{output},
+			Stdout: &iohelper.NopWriteCloser{Writer: output},
+			Stderr: &iohelper.NopWriteCloser{Writer: output},
 			Env:    []string{fmt.Sprintf("PS1=%s", prompt.String())},
 		})
 		require.NoError(t, err)
@@ -1148,8 +1211,8 @@ func testClientGatewayContainerExecTty(t *testing.T, sb integration.Sandbox) {
 			Args:   []string{"sh"},
 			Tty:    true,
 			Stdin:  inputR,
-			Stdout: &nopCloser{output},
-			Stderr: &nopCloser{output},
+			Stdout: &iohelper.NopWriteCloser{Writer: output},
+			Stderr: &iohelper.NopWriteCloser{Writer: output},
 			Env:    []string{fmt.Sprintf("PS1=%s", prompt.String())},
 		})
 		require.NoError(t, err)
@@ -1243,8 +1306,8 @@ func testClientGatewayContainerCancelExecTty(t *testing.T, sb integration.Sandbo
 			Args:   []string{"sh"},
 			Tty:    true,
 			Stdin:  inputR,
-			Stdout: &nopCloser{output},
-			Stderr: &nopCloser{output},
+			Stdout: &iohelper.NopWriteCloser{Writer: output},
+			Stderr: &iohelper.NopWriteCloser{Writer: output},
 			Env:    []string{fmt.Sprintf("PS1=%s", prompt.String())},
 		})
 		require.NoError(t, err)
@@ -1280,8 +1343,8 @@ func testClientSlowCacheRootfsRef(t *testing.T, sb integration.Sandbox) {
 	b := func(ctx context.Context, c client.Client) (*client.Result, error) {
 		id := identity.NewID()
 		input := llb.Scratch().File(
-			llb.Mkdir("/found", 0700).
-				Mkfile("/found/data", 0600, []byte(id)),
+			llb.Mkdir("/found", 0o700).
+				Mkfile("/found/data", 0o600, []byte(id)),
 		)
 
 		st := llb.Image("busybox:latest").Run(
@@ -1386,7 +1449,7 @@ func testClientGatewayContainerPlatformPATH(t *testing.T, sb integration.Sandbox
 				output := bytes.NewBuffer(nil)
 				pid1, err := ctr.Start(ctx, client.StartRequest{
 					Args:   []string{"/bin/sh", "-c", "echo -n $PATH"},
-					Stdout: &nopCloser{output},
+					Stdout: &iohelper.NopWriteCloser{Writer: output},
 				})
 				require.NoError(t, err)
 
@@ -1442,7 +1505,7 @@ func testClientGatewayExecError(t *testing.T, sb integration.Sandbox) {
 			"rootfs and readwrite mount",
 			llb.Image("busybox:latest").Run(
 				llb.Shlexf(`sh -c "echo %s > /data && echo %s > /rw/data && fail"`, id, id),
-				llb.AddMount("/rw", llb.Scratch().File(llb.Mkfile("foo", 0700, []byte(id)))),
+				llb.AddMount("/rw", llb.Scratch().File(llb.Mkfile("foo", 0o700, []byte(id)))),
 			).Root(),
 			2,
 			[]string{"/data", "/rw/data", "/rw/foo"},
@@ -1460,7 +1523,7 @@ func testClientGatewayExecError(t *testing.T, sb integration.Sandbox) {
 				llb.Shlexf(`sh -c "echo %s > /data && echo %s > /rw/data && fail"`, id, id),
 				llb.AddMount(
 					"/rw",
-					llb.Scratch().File(llb.Mkfile("foo", 0700, []byte(id))),
+					llb.Scratch().File(llb.Mkfile("foo", 0o700, []byte(id))),
 					llb.ForceNoOutput,
 				),
 			).Root(),
@@ -1527,8 +1590,8 @@ func testClientGatewayExecError(t *testing.T, sb integration.Sandbox) {
 					Args:   []string{"sh"},
 					Tty:    true,
 					Stdin:  inputR,
-					Stdout: &nopCloser{pid1Output},
-					Stderr: &nopCloser{pid1Output},
+					Stdout: &iohelper.NopWriteCloser{Writer: pid1Output},
+					Stderr: &iohelper.NopWriteCloser{Writer: pid1Output},
 					Env:    []string{fmt.Sprintf("PS1=%s", prompt.String())},
 				})
 				require.NoError(t, err)
@@ -1541,7 +1604,7 @@ func testClientGatewayExecError(t *testing.T, sb integration.Sandbox) {
 						Env:          meta.Env,
 						User:         meta.User,
 						Cwd:          meta.Cwd,
-						Stdout:       &nopCloser{output},
+						Stdout:       &iohelper.NopWriteCloser{Writer: output},
 						SecurityMode: exec.Security,
 					})
 					require.NoError(t, err)
@@ -1579,8 +1642,8 @@ func testClientGatewaySlowCacheExecError(t *testing.T, sb integration.Sandbox) {
 
 	id := identity.NewID()
 	input := llb.Scratch().File(
-		llb.Mkdir("/found", 0700).
-			Mkfile("/found/data", 0600, []byte(id)),
+		llb.Mkdir("/found", 0o700).
+			Mkfile("/found/data", 0o600, []byte(id)),
 	)
 
 	st := llb.Image("busybox:latest").Run(
@@ -1640,7 +1703,7 @@ func testClientGatewaySlowCacheExecError(t *testing.T, sb integration.Sandbox) {
 		output := bytes.NewBuffer(nil)
 		proc, err := ctr.Start(ctx, client.StartRequest{
 			Args:   []string{"cat", "/problem/found/data"},
-			Stdout: &nopCloser{output},
+			Stdout: &iohelper.NopWriteCloser{Writer: output},
 		})
 		require.NoError(t, err)
 
@@ -1691,9 +1754,9 @@ func testClientGatewayExecFileActionError(t *testing.T, sb integration.Sandbox) 
 		}{{
 			"mkfile",
 			llb.Scratch().File(
-				llb.Mkdir("/found", 0700).
-					Mkfile("/found/foo", 0600, []byte(id)).
-					Mkfile("/notfound/foo", 0600, []byte(id)),
+				llb.Mkdir("/found", 0o700).
+					Mkfile("/found/foo", 0o600, []byte(id)).
+					Mkfile("/notfound/foo", 0o600, []byte(id)),
 			),
 			0, 3, "/input/found/foo",
 		}, {
@@ -1701,7 +1764,7 @@ func testClientGatewayExecFileActionError(t *testing.T, sb integration.Sandbox) 
 			llb.Image("busybox").File(
 				llb.Copy(
 					llb.Scratch().File(
-						llb.Mkdir("/foo", 0600).Mkfile("/foo/bar", 0700, []byte(id)),
+						llb.Mkdir("/foo", 0o600).Mkfile("/foo/bar", 0o700, []byte(id)),
 					),
 					"/foo/bar",
 					"/notfound/baz",
@@ -1712,7 +1775,7 @@ func testClientGatewayExecFileActionError(t *testing.T, sb integration.Sandbox) 
 			"copy from action",
 			llb.Image("busybox").File(
 				llb.Copy(
-					llb.Mkdir("/foo", 0600).Mkfile("/foo/bar", 0700, []byte(id)).WithState(llb.Scratch()),
+					llb.Mkdir("/foo", 0o600).Mkfile("/foo/bar", 0o700, []byte(id)).WithState(llb.Scratch()),
 					"/foo/bar",
 					"/notfound/baz",
 				),
@@ -1790,7 +1853,7 @@ func testClientGatewayExecFileActionError(t *testing.T, sb integration.Sandbox) 
 				output := bytes.NewBuffer(nil)
 				proc, err := ctr.Start(ctx, client.StartRequest{
 					Args:   []string{"cat", tt.Path},
-					Stdout: &nopCloser{output},
+					Stdout: &iohelper.NopWriteCloser{Writer: output},
 				})
 				require.NoError(t, err)
 
@@ -1904,8 +1967,8 @@ func testClientGatewayContainerSecurityMode(t *testing.T, sb integration.Sandbox
 
 		pid, err := ctr.Start(ctx, client.StartRequest{
 			Args:         command,
-			Stdout:       &nopCloser{stdout},
-			Stderr:       &nopCloser{stderr},
+			Stdout:       &iohelper.NopWriteCloser{Writer: stdout},
+			Stderr:       &iohelper.NopWriteCloser{Writer: stderr},
 			SecurityMode: mode,
 		})
 		if err != nil {
@@ -1995,8 +2058,8 @@ func testClientGatewayContainerExtraHosts(t *testing.T, sb integration.Sandbox) 
 
 		pid, err := ctr.Start(ctx, client.StartRequest{
 			Args:   []string{"grep", "169.254.11.22\tsome.host", "/etc/hosts"},
-			Stdout: &nopCloser{stdout},
-			Stderr: &nopCloser{stderr},
+			Stdout: &iohelper.NopWriteCloser{Writer: stdout},
+			Stderr: &iohelper.NopWriteCloser{Writer: stderr},
 		})
 		if err != nil {
 			ctr.Release(ctx)
@@ -2094,8 +2157,8 @@ func testClientGatewayContainerHostNetworking(t *testing.T, sb integration.Sandb
 
 		pid, err := ctr.Start(ctx, client.StartRequest{
 			Args:   []string{"/bin/sh", "-c", fmt.Sprintf("nc 127.0.0.1 %s | grep foo", port)},
-			Stdout: &nopCloser{stdout},
-			Stderr: &nopCloser{stderr},
+			Stdout: &iohelper.NopWriteCloser{Writer: stdout},
+			Stderr: &iohelper.NopWriteCloser{Writer: stderr},
 		})
 		if err != nil {
 			ctr.Release(ctx)
@@ -2229,6 +2292,121 @@ func testClientGatewayContainerSignal(t *testing.T, sb integration.Sandbox) {
 	checkAllReleasable(t, c, sb, true)
 }
 
+func testClientGatewayCanceledCredentialsCallbackReturns(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	requiresLinux(t)
+
+	ctx := sb.Context()
+
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	username := "buildkit-user"
+	password := "buildkit-pass"
+	repo := "buildkit/auth-session-" + identity.NewID()
+	backendRef := registry + "/" + repo + ":latest"
+
+	st := llb.Scratch().File(llb.Mkfile("hello", 0o644, []byte("world")))
+	def, err := st.Marshal(ctx)
+	require.NoError(t, err)
+	_, err = c.Solve(ctx, def, SolveOpt{
+		Exports: []ExportEntry{{
+			Type: ExporterImage,
+			Attrs: map[string]string{
+				"name": backendRef,
+				"push": "true",
+			},
+		}},
+	}, nil)
+	require.NoError(t, err)
+
+	target, err := url.Parse("http://" + registry)
+	require.NoError(t, err)
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	director := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		director(req)
+		req.Host = target.Host
+	}
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, secret, ok := r.BasicAuth()
+		if !ok || user != username || secret != password {
+			w.Header().Set("WWW-Authenticate", `Basic realm="buildkit-test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxyServer.Close)
+
+	ref := strings.TrimPrefix(proxyServer.URL, "http://") + "/" + repo + ":latest"
+	host := strings.SplitN(ref, "/", 2)[0]
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+
+	provider := &blockingAuthProvider{
+		t:           t,
+		host:        host,
+		username:    username,
+		password:    password,
+		started:     started,
+		startedOnce: &startedOnce,
+		release:     release,
+	}
+
+	_, err = c.Build(ctx, SolveOpt{
+		Session: []session.Attachable{provider},
+	}, "buildkit_test", func(ctx context.Context, gw client.Client) (*client.Result, error) {
+		reqCtx, cancel := context.WithCancelCause(ctx)
+		defer cancel(context.Canceled)
+
+		errCh := make(chan error, 1)
+		go func() {
+			_, _, _, err := gw.ResolveImageConfig(reqCtx, ref, sourceresolver.Opt{})
+			errCh <- err
+		}()
+
+		select {
+		case <-started:
+		case <-time.After(15 * time.Second):
+			return nil, errors.New("timed out waiting for registry credential callback")
+		}
+
+		cancel(context.Canceled)
+
+		select {
+		case err := <-errCh:
+			require.Error(t, err)
+			return client.NewResult(), nil
+		case <-time.After(3 * time.Second):
+			close(release)
+		}
+
+		select {
+		case err := <-errCh:
+			require.Error(t, err)
+		case <-time.After(15 * time.Second):
+			return nil, errors.New("timed out draining canceled image config resolution")
+		}
+
+		return nil, errors.New("canceled image config resolution stayed blocked until the credentials callback was released")
+	}, nil)
+	require.NoError(t, err)
+
+	checkAllReleasable(t, c, sb, true)
+}
+
 func testClientGatewayNilResult(t *testing.T, sb integration.Sandbox) {
 	workers.CheckFeatureCompat(t, sb, workers.FeatureMergeDiff)
 	requiresLinux(t)
@@ -2312,10 +2490,35 @@ func testClientGatewayEmptyImageExec(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 }
 
-type nopCloser struct {
-	io.Writer
+type blockingAuthProvider struct {
+	sessionauth.UnimplementedAuthServer
+
+	t           *testing.T
+	host        string
+	username    string
+	password    string
+	started     chan struct{}
+	startedOnce *sync.Once
+	release     chan struct{}
 }
 
-func (n *nopCloser) Close() error {
-	return nil
+func (p *blockingAuthProvider) Register(server *grpc.Server) {
+	sessionauth.RegisterAuthServer(server, p)
+}
+
+func (p *blockingAuthProvider) Credentials(ctx context.Context, req *sessionauth.CredentialsRequest) (*sessionauth.CredentialsResponse, error) {
+	require.Equal(p.t, p.host, req.Host)
+	p.startedOnce.Do(func() {
+		close(p.started)
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	case <-p.release:
+		return &sessionauth.CredentialsResponse{
+			Username: p.username,
+			Secret:   p.password,
+		}, nil
+	}
 }

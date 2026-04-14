@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile-upstream:master
 
-ARG GO_VERSION=1.25
-ARG DEBIAN_VERSION=bookworm
+ARG GO_VERSION=1.26
+ARG DEBIAN_VERSION=trixie
 ARG PROTOC_VERSION=3.11.4
 ARG PROTOC_GOOGLEAPIS_VERSION=2af421884dd468d565137215c946ebe4e245ae26
 
@@ -27,7 +27,7 @@ ARG PROTOC_GOOGLEAPIS_VERSION
 RUN <<EOT
   set -e
   wget -q https://github.com/googleapis/googleapis/archive/${PROTOC_GOOGLEAPIS_VERSION}.zip -O googleapis.zip
-  unzip googleapis.zip '*.proto' -d /opt
+  unzip googleapis.zip '*/google/rpc/*.proto' -d /opt
   mkdir -p /opt/googleapis
   mv /opt/googleapis-${PROTOC_GOOGLEAPIS_VERSION} /opt/googleapis/include
 EOT

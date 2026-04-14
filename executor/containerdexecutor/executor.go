@@ -24,6 +24,7 @@ import (
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/iohelper"
 	"github.com/moby/buildkit/util/network"
 	"github.com/pkg/errors"
 )
@@ -115,6 +116,9 @@ type containerState struct {
 func (w *containerdExecutor) Run(ctx context.Context, id string, root executor.Mount, mounts []executor.Mount, process executor.ProcessInfo, started chan<- struct{}) (rec resourcestypes.Recorder, err error) {
 	if id == "" {
 		id = identity.NewID()
+	}
+	if err := executor.ValidContainerID(id); err != nil {
+		return nil, err
 	}
 
 	startedOnce := sync.Once{}
@@ -324,10 +328,10 @@ func fixProcessOutput(process *executor.ProcessInfo) {
 	// failed to start io pipe copy: unable to copy pipes: containerd-shim: opening file "" failed: open : no such file or directory: unknown
 	// So just stub out any missing output
 	if process.Stdout == nil {
-		process.Stdout = &nopCloser{io.Discard}
+		process.Stdout = &iohelper.NopWriteCloser{Writer: io.Discard}
 	}
 	if process.Stderr == nil {
-		process.Stderr = &nopCloser{io.Discard}
+		process.Stderr = &iohelper.NopWriteCloser{Writer: io.Discard}
 	}
 }
 
@@ -448,12 +452,4 @@ func (w *containerdExecutor) runProcess(ctx context.Context, p ctd.Process, resi
 			return errors.Errorf("failed to kill process on cancel")
 		}
 	}
-}
-
-type nopCloser struct {
-	io.Writer
-}
-
-func (c *nopCloser) Close() error {
-	return nil
 }

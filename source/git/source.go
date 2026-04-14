@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/client"
@@ -30,6 +31,7 @@ import (
 	"github.com/moby/buildkit/util/gitutil"
 	"github.com/moby/buildkit/util/gitutil/gitobject"
 	"github.com/moby/buildkit/util/gitutil/gitsign"
+	"github.com/moby/buildkit/util/pgpsign"
 	"github.com/moby/buildkit/util/progress/logs"
 	"github.com/moby/buildkit/util/urlutil"
 	"github.com/moby/locker"
@@ -64,7 +66,7 @@ type MetadataOpts struct {
 
 // Supported returns nil if the system supports Git source
 func Supported() error {
-	if err := exec.Command("git", "version").Run(); err != nil {
+	if err := exec.CommandContext(context.TODO(), "git", "version").Run(); err != nil {
 		return errors.Wrap(err, "failed to find git binary")
 	}
 	return nil
@@ -133,7 +135,12 @@ func (gs *Source) Identifier(scheme, ref string, attrs map[string]string, platfo
 				id.VerifySignature = &GitSignatureVerifyOptions{}
 			}
 			id.VerifySignature.IgnoreSignedTag = v == "true"
+		case pb.AttrGitMTime:
+			id.MTime = v
 		}
+	}
+	if err := validateGitRef(id.Ref); err != nil {
+		return nil, err
 	}
 
 	return id, nil
@@ -263,6 +270,9 @@ func (gs *gitSourceHandler) shaToCacheKey(sha, ref string) string {
 	if gs.src.SkipSubmodules {
 		key += "(skip-submodules)"
 	}
+	if gs.src.MTime != "" && gs.src.MTime != "checkout" {
+		key += "(mtime=" + gs.src.MTime + ")"
+	}
 	return key
 }
 
@@ -308,7 +318,7 @@ func verifyGitSignature(md *Metadata, opts *GitSignatureVerifyOptions) error {
 			if err := tagObj.VerifyChecksum(md.Checksum); err != nil {
 				return errors.Wrap(err, "tag object checksum verification failed")
 			}
-			tagVerifyError = gitsign.VerifySignature(tagObj, opts.PubKey, &gitsign.VerifyPolicy{
+			tagVerifyError = gitsign.VerifySignature(tagObj, opts.PubKey, &pgpsign.VerifyPolicy{
 				RejectExpiredKeys: opts.RejectExpiredKeys,
 			})
 			if tagVerifyError == nil {
@@ -333,7 +343,7 @@ func verifyGitSignature(md *Metadata, opts *GitSignatureVerifyOptions) error {
 	if err := commitObj.VerifyChecksum(expected); err != nil {
 		return errors.Wrap(err, "commit object checksum verification failed")
 	}
-	return gitsign.VerifySignature(commitObj, opts.PubKey, &gitsign.VerifyPolicy{
+	return gitsign.VerifySignature(commitObj, opts.PubKey, &pgpsign.VerifyPolicy{
 		RejectExpiredKeys: opts.RejectExpiredKeys,
 	})
 }
@@ -547,10 +557,9 @@ func (gs *gitSourceHandler) resolveMetadata(ctx context.Context, jobCtx solver.J
 			return nil, err
 		}
 	}
-
 	// TODO: should we assume that remote tag is immutable? add a timer?
 
-	buf, err := tmpGit.Run(ctx, "ls-remote", gs.src.Remote, ref, ref+"^{}")
+	buf, err := tmpGit.Run(ctx, "ls-remote", "--", gs.src.Remote, ref, ref+"^{}")
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to fetch remote %s", urlutil.RedactCredentials(remote))
 	}
@@ -861,11 +870,10 @@ func (gs *gitSourceHandler) tryRemoteFetch(ctx context.Context, g session.Group,
 		}
 		gs.src.Ref = ref
 	}
-
 	doFetch := true
 	if gitutil.IsCommitSHA(ref) {
 		// skip fetch if commit already exists
-		if _, err := git.Run(ctx, "cat-file", "-e", ref+"^{commit}"); err == nil {
+		if _, err := git.Run(ctx, "cat-file", "-e", "--", ref+"^{commit}"); err == nil {
 			doFetch = false
 		}
 	}
@@ -879,15 +887,21 @@ func (gs *gitSourceHandler) tryRemoteFetch(ctx context.Context, g session.Group,
 	}
 
 	if doFetch {
+		gitDirRoot, err := os.OpenRoot(gitDir)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to open git dir root")
+		}
+		defer gitDirRoot.Close()
+
 		// make sure no old lock files have leaked
-		os.RemoveAll(filepath.Join(gitDir, "shallow.lock"))
+		gitDirRoot.RemoveAll("shallow.lock")
 
 		args := []string{"fetch"}
 		if !gitutil.IsCommitSHA(ref) { // TODO: find a branch from ls-remote?
 			args = append(args, "--depth=1", "--no-tags")
 		} else {
 			args = append(args, "--tags")
-			if _, err := os.Lstat(filepath.Join(gitDir, "shallow")); err == nil {
+			if _, err := gitDirRoot.Lstat("shallow"); err == nil {
 				args = append(args, "--unshallow")
 			}
 		}
@@ -895,7 +909,7 @@ func (gs *gitSourceHandler) tryRemoteFetch(ctx context.Context, g session.Group,
 		if gitutil.IsCommitSHA(ref) {
 			args = append(args, ref)
 		} else {
-			args = append(args, "--force", ref+":"+targetRef)
+			args = append(args, "--force", "--", ref+":"+targetRef)
 		}
 		if _, err := git.Run(ctx, args...); err != nil {
 			err := errors.Wrapf(err, "failed to fetch remote %s", urlutil.RedactCredentials(gs.src.Remote))
@@ -904,7 +918,7 @@ func (gs *gitSourceHandler) tryRemoteFetch(ctx context.Context, g session.Group,
 				// only hope is to abandon the existing shared repo and start a fresh one
 				return nil, &wouldClobberExistingTagError{err}
 			}
-			if strings.Contains(err.Error(), "(unable to update local ref)") && strings.Contains(err.Error(), "some local refs could not be updated;") {
+			if isUnableToUpdateLocalRef(err) {
 				// this can happen if a branch updated in remote so that old branch
 				// is now a parent dir of a new branch
 				return nil, &unableToUpdateLocalRefError{err}
@@ -934,7 +948,7 @@ func (gs *gitSourceHandler) tryRemoteFetch(ctx context.Context, g session.Group,
 			} else {
 				// try to fetch the commit directly
 				args := []string{"fetch", "--tags"}
-				if _, err := os.Lstat(filepath.Join(gitDir, "shallow")); err == nil {
+				if _, err := gitDirRoot.Lstat("shallow"); err == nil {
 					args = append(args, "--unshallow")
 				}
 				args = append(args, "origin", gs.cacheCommit)
@@ -992,7 +1006,7 @@ func (gs *gitSourceHandler) checkout(ctx context.Context, repo *gitRepo, g sessi
 		}
 	}()
 
-	subdir := path.Clean(gs.src.Subdir)
+	subdir := path.Join("/", gs.src.Subdir)
 	if subdir == "/" {
 		subdir = "."
 	}
@@ -1042,7 +1056,7 @@ func (gs *gitSourceHandler) checkout(ctx context.Context, repo *gitRepo, g sessi
 		} else {
 			pullref += ":" + pullref
 		}
-		_, err = checkoutGit.Run(ctx, "fetch", "-u", "--depth=1", "origin", pullref)
+		_, err = checkoutGit.Run(ctx, "fetch", "-u", "--depth=1", "--", "origin", pullref)
 		if err != nil {
 			return nil, err
 		}
@@ -1070,7 +1084,7 @@ func (gs *gitSourceHandler) checkout(ctx context.Context, repo *gitRepo, g sessi
 			}
 		}
 		checkoutGit := git.New(gitutil.WithWorkTree(cd), gitutil.WithGitDir(gitDir))
-		_, err = checkoutGit.Run(ctx, "checkout", ref, "--", ".")
+		_, err = checkoutGit.Run(ctx, "checkout", "--no-overlay", ref, "--", ".")
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to checkout remote %s", urlutil.RedactCredentials(gs.src.Remote))
 		}
@@ -1085,7 +1099,19 @@ func (gs *gitSourceHandler) checkout(ctx context.Context, repo *gitRepo, g sessi
 	}
 
 	if subdir != "." {
-		d, err := os.Open(filepath.Join(cd, subdir))
+		subdir = filepath.FromSlash(subdir)
+		subdir = rootRelativePath(subdir)
+		cdRoot, err := os.OpenRoot(cd)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to open checkout dir root")
+		}
+		defer cdRoot.Close()
+
+		if err := validateDirsOnly(cdRoot, subdir); err != nil {
+			return nil, errors.Wrapf(err, "invalid subdir %v", subdir)
+		}
+
+		d, err := cdRoot.Open(subdir)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to open subdir %v", subdir)
 		}
@@ -1109,6 +1135,16 @@ func (gs *gitSourceHandler) checkout(ctx context.Context, repo *gitRepo, g sessi
 		d = nil // reset defer
 		if err := os.RemoveAll(cd); err != nil {
 			return nil, err
+		}
+	}
+
+	if gs.src.MTime == "commit" {
+		commitTime, err := getCommitTime(ctx, git, ref)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to get commit time for %s", urlutil.RedactCredentials(gs.src.Remote))
+		}
+		if err := resetSnapshotMtimes(checkoutDir, commitTime); err != nil {
+			return nil, errors.Wrapf(err, "failed to normalize mtimes for %s", urlutil.RedactCredentials(gs.src.Remote))
 		}
 	}
 
@@ -1140,6 +1176,50 @@ func (gs *gitSourceHandler) checkout(ctx context.Context, repo *gitRepo, g sessi
 	return snap, nil
 }
 
+// getCommitTime returns the committer timestamp of the resolved commit.
+// For annotated tags, it peels to the underlying commit.
+func getCommitTime(ctx context.Context, git *gitutil.GitCLI, ref string) (time.Time, error) {
+	// %ct = committer date, UNIX timestamp; ^{commit} peels tags
+	buf, err := git.Run(ctx, "log", "-1", "--format=%ct", ref+"^{commit}")
+	if err != nil {
+		return time.Time{}, err
+	}
+	ts, err := strconv.ParseInt(strings.TrimSpace(string(buf)), 10, 64)
+	if err != nil {
+		return time.Time{}, errors.Wrapf(err, "failed to parse commit timestamp %q", string(buf))
+	}
+	return time.Unix(ts, 0), nil
+}
+
+// resetSnapshotMtimes walks dir and sets the mtime of every file,
+// symlink, and directory to t. Directories are set bottom-up so that
+// a parent's mtime is not invalidated by a later child write.
+func resetSnapshotMtimes(dir string, t time.Time) error {
+	var dirs []string
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			dirs = append(dirs, p)
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return lchtimes(p, t)
+		}
+		return os.Chtimes(p, t, t)
+	})
+	if err != nil {
+		return err
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := os.Chtimes(dirs[i], t, t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type wouldClobberExistingTagError struct {
 	error
 }
@@ -1154,6 +1234,25 @@ type unableToUpdateLocalRefError struct {
 
 func (e *unableToUpdateLocalRefError) Unwrap() error {
 	return e.error
+}
+
+func isUnableToUpdateLocalRef(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "some local refs could not be updated;") {
+		return false
+	}
+	return strings.Contains(msg, "(unable to update local ref)") ||
+		strings.Contains(msg, "refname conflict")
+}
+
+func validateGitRef(ref string) error {
+	if strings.HasPrefix(ref, "-") {
+		return errors.Errorf("invalid git ref %q", ref)
+	}
+	return nil
 }
 
 func (gs *gitSourceHandler) emptyGitCli(ctx context.Context, g session.Group, opts ...gitutil.Option) (*gitutil.GitCLI, func() error, error) {
@@ -1276,4 +1375,31 @@ func gitCLI(opts ...gitutil.Option) *gitutil.GitCLI {
 		}),
 	}, opts...)
 	return gitutil.NewGitCLI(opts...)
+}
+
+// validateDirsOnly checks that the given subpath in the repository
+// only contains directories without any symlinks or files.
+func validateDirsOnly(r *os.Root, subpath string) error {
+	rel := rootRelativePath(subpath)
+	if rel == "" || rel == "." {
+		return nil
+	}
+
+	p := ""
+	for part := range strings.SplitSeq(rel, string(filepath.Separator)) {
+		p = filepath.Join(p, part)
+
+		fi, err := r.Lstat(p)
+		if err != nil {
+			return errors.Wrapf(err, "failed to lstat %q", p)
+		}
+		if !fi.IsDir() {
+			return errors.Errorf("git subpath %q contains non-directory %q", subpath, p)
+		}
+	}
+	return nil
+}
+
+func rootRelativePath(path string) string {
+	return strings.TrimPrefix(filepath.Clean(path), string(filepath.Separator))
 }

@@ -54,6 +54,11 @@ type Config struct {
 	// PrefetchTimeoutSec is the default timeout (in seconds) when the prefetching takes long. Default is 10s.
 	PrefetchTimeoutSec int64 `toml:"prefetch_timeout_sec" json:"prefetch_timeout_sec"`
 
+	// PrefetchAsyncSize is a threshold (in bytes) to allow running containers without waiting for
+	// prefetch completion. If prefetch size exceeds this threshold, prefetch continues in background.
+	// Default is 0 (disabled).
+	PrefetchAsyncSize int64 `toml:"prefetch_async_size" json:"prefetch_async_size"`
+
 	// NoPrefetch disables prefetching. Default is false.
 	NoPrefetch bool `toml:"noprefetch" json:"noprefetch"`
 
@@ -74,6 +79,9 @@ type Config struct {
 
 	// NoPrometheus disables exposing filesystem-related metrics. Default is false.
 	NoPrometheus bool `toml:"no_prometheus" json:"no_prometheus"`
+
+	// LogFileAccess enables logging information on first access to each file. Default is false.
+	LogFileAccess bool `toml:"log_file_access" json:"log_file_access"`
 
 	// BlobConfig is config for layer blob management.
 	BlobConfig `toml:"blob" json:"blob"`
@@ -139,6 +147,9 @@ type DirectoryCacheConfig struct {
 
 	// Direct disables on-memory data cache. Default is true for saving memory usage.
 	Direct bool `toml:"direct" default:"true" json:"direct"`
+
+	// FadvDontNeed forcefully clean fscache pagecache for saving memory. Default is false.
+	FadvDontNeed bool `toml:"fadv_dontneed" json:"fadv_dontneed"`
 }
 
 // FuseConfig is configuration for FUSE fs.

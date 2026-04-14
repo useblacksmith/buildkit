@@ -54,7 +54,7 @@ var lintTests = integration.TestFuncs(
 )
 
 func testDefinitionDescription(t *testing.T, sb integration.Sandbox) {
-	dockerfile := []byte(`# check=experimental=InvalidDefinitionDescription
+	dockerfile := []byte(`# check=skip=all;experimental=InvalidDefinitionDescription
 # foo this is the foo
 ARG foo=bar
 
@@ -132,14 +132,33 @@ FROM scratch
 COPY Dockerfile .
 ADD Dockerfile /windy
 `)
+
 	checkLinterWarnings(t, sb, &lintTestParams{
 		Dockerfile:           dockerfile,
 		DockerIgnore:         dockerignore,
 		BuildErrLocation:     3,
 		StreamBuildErrRegexp: regexp.MustCompile(`failed to solve: failed to compute cache key: failed to calculate checksum of ref [^\s]+ "/Dockerfile": not found`),
+		Warnings: []expectedLintWarning{
+			{
+				RuleName:    "CopyIgnoredFile",
+				Description: "Attempting to Copy file that is excluded by .dockerignore",
+				Detail:      `Attempting to Copy file "Dockerfile" that is excluded by .dockerignore`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/copy-ignored-file/",
+				Level:       1,
+				Line:        3,
+			},
+			{
+				RuleName:    "CopyIgnoredFile",
+				Description: "Attempting to Copy file that is excluded by .dockerignore",
+				Detail:      `Attempting to Add file "Dockerfile" that is excluded by .dockerignore`,
+				URL:         "https://docs.docker.com/go/dockerfile/rule/copy-ignored-file/",
+				Level:       1,
+				Line:        4,
+			},
+		},
 	})
 
-	dockerfile = []byte(`# check=experimental=CopyIgnoredFile
+	dockerfile = []byte(`
 FROM scratch
 COPY Dockerfile .
 ADD Dockerfile /windy
@@ -170,35 +189,17 @@ ADD Dockerfile /windy
 		},
 	})
 
-	dockerfile = []byte(`# check=skip=all;experimental=CopyIgnoredFile
+	dockerfile = []byte(`# check=skip=CopyIgnoredFile
+
 FROM scratch
 COPY Dockerfile .
 ADD Dockerfile /windy
 `)
-
 	checkLinterWarnings(t, sb, &lintTestParams{
 		Dockerfile:           dockerfile,
 		DockerIgnore:         dockerignore,
 		BuildErrLocation:     3,
 		StreamBuildErrRegexp: regexp.MustCompile(`failed to solve: failed to compute cache key: failed to calculate checksum of ref [^\s]+ "/Dockerfile": not found`),
-		Warnings: []expectedLintWarning{
-			{
-				RuleName:    "CopyIgnoredFile",
-				Description: "Attempting to Copy file that is excluded by .dockerignore",
-				Detail:      `Attempting to Copy file "Dockerfile" that is excluded by .dockerignore`,
-				URL:         "https://docs.docker.com/go/dockerfile/rule/copy-ignored-file/",
-				Level:       1,
-				Line:        3,
-			},
-			{
-				RuleName:    "CopyIgnoredFile",
-				Description: "Attempting to Copy file that is excluded by .dockerignore",
-				Detail:      `Attempting to Add file "Dockerfile" that is excluded by .dockerignore`,
-				URL:         "https://docs.docker.com/go/dockerfile/rule/copy-ignored-file/",
-				Level:       1,
-				Line:        4,
-			},
-		},
 	})
 
 	dockerignore = []byte(`
@@ -229,10 +230,21 @@ COPY ./Dockerfile .
 		Dockerfile:   dockerfile,
 		DockerIgnore: dockerignore,
 	})
+
+	// No warnings should occur if we copy the directory.
+	dockerfile = []byte(`
+FROM scratch
+COPY . .
+	`)
+	checkLinterWarnings(t, sb, &lintTestParams{
+		Dockerfile:   dockerfile,
+		DockerIgnore: dockerignore,
+	})
 }
 
 func testSecretsUsedInArgOrEnv(t *testing.T, sb integration.Sandbox) {
-	dockerfile := []byte(`
+	dockerfile := []byte(`# check=skip=InvalidDefinitionDescription
+
 FROM scratch
 ARG SECRET_PASSPHRASE
 ENV SUPER_Secret=foo
@@ -242,6 +254,9 @@ ENV apikey=bar sunflower=foo
 ENV git_key=
 ENV PUBLIC_KEY=
 ARG public_token
+ARG SECRET_PASSPHRASE_FILE
+ENV password_file=bar secret_File=baz
+ARG AUTH_MODULE_VERSION
 # check=skip=SecretsUsedInArgOrEnv // allow secret in environment
 ENV password=bar
 # check=skip=SecretsUsedInArgOrEnv // allow secret in arg
@@ -260,7 +275,7 @@ ARG alternate_password
 				Detail:      `Do not use ARG or ENV instructions for sensitive data (ARG "SECRET_PASSPHRASE")`,
 				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
 				Level:       1,
-				Line:        3,
+				Line:        4,
 			},
 			{
 				RuleName:    "SecretsUsedInArgOrEnv",
@@ -268,7 +283,7 @@ ARG alternate_password
 				Detail:      `Do not use ARG or ENV instructions for sensitive data (ENV "SUPER_Secret")`,
 				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
 				Level:       1,
-				Line:        4,
+				Line:        5,
 			},
 			{
 				RuleName:    "SecretsUsedInArgOrEnv",
@@ -276,7 +291,7 @@ ARG alternate_password
 				Detail:      `Do not use ARG or ENV instructions for sensitive data (ENV "password")`,
 				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
 				Level:       1,
-				Line:        5,
+				Line:        6,
 			},
 			{
 				RuleName:    "SecretsUsedInArgOrEnv",
@@ -284,7 +299,7 @@ ARG alternate_password
 				Detail:      `Do not use ARG or ENV instructions for sensitive data (ENV "secret")`,
 				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
 				Level:       1,
-				Line:        5,
+				Line:        6,
 			},
 			{
 				RuleName:    "SecretsUsedInArgOrEnv",
@@ -292,7 +307,7 @@ ARG alternate_password
 				Detail:      `Do not use ARG or ENV instructions for sensitive data (ARG "auth")`,
 				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
 				Level:       1,
-				Line:        6,
+				Line:        7,
 			},
 			{
 				RuleName:    "SecretsUsedInArgOrEnv",
@@ -300,7 +315,7 @@ ARG alternate_password
 				Detail:      `Do not use ARG or ENV instructions for sensitive data (ARG "super_duper_secret_token")`,
 				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
 				Level:       1,
-				Line:        6,
+				Line:        7,
 			},
 			{
 				RuleName:    "SecretsUsedInArgOrEnv",
@@ -308,7 +323,7 @@ ARG alternate_password
 				Detail:      `Do not use ARG or ENV instructions for sensitive data (ENV "apikey")`,
 				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
 				Level:       1,
-				Line:        7,
+				Line:        8,
 			},
 			{
 				RuleName:    "SecretsUsedInArgOrEnv",
@@ -316,7 +331,7 @@ ARG alternate_password
 				Detail:      `Do not use ARG or ENV instructions for sensitive data (ENV "git_key")`,
 				URL:         "https://docs.docker.com/go/dockerfile/rule/secrets-used-in-arg-or-env/",
 				Level:       1,
-				Line:        8,
+				Line:        9,
 			},
 		},
 	})
@@ -1692,8 +1707,9 @@ func checkProgressStream(t *testing.T, sb integration.Sandbox, lintTest *lintTes
 	} else {
 		if lintTest.BuildErr != "" {
 			require.ErrorContains(t, err, lintTest.BuildErr)
-		} else if !lintTest.StreamBuildErrRegexp.MatchString(err.Error()) {
-			t.Fatalf("error %q does not match %q", err.Error(), lintTest.StreamBuildErrRegexp.String())
+		} else {
+			require.Error(t, err)
+			require.Regexp(t, lintTest.StreamBuildErrRegexp, err)
 		}
 	}
 
@@ -1745,10 +1761,10 @@ func checkLinterWarnings(t *testing.T, sb integration.Sandbox, lintTest *lintTes
 
 	if lintTest.TmpDir == nil {
 		testfiles := []fstest.Applier{
-			fstest.CreateFile("Dockerfile", lintTest.Dockerfile, 0600),
+			fstest.CreateFile("Dockerfile", lintTest.Dockerfile, 0o600),
 		}
 		if lintTest.DockerIgnore != nil {
-			testfiles = append(testfiles, fstest.CreateFile(".dockerignore", lintTest.DockerIgnore, 0600))
+			testfiles = append(testfiles, fstest.CreateFile(".dockerignore", lintTest.DockerIgnore, 0o600))
 		}
 		lintTest.TmpDir = integration.Tmpdir(
 			t,

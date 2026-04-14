@@ -57,6 +57,14 @@ func TestRepeatedFetchKeepGitDirSHA256(t *testing.T) {
 	testRepeatedFetch(t, true, "sha256")
 }
 
+func TestFetchAfterSubmoduleRemovalSHA1(t *testing.T) {
+	testFetchAfterSubmoduleRemoval(t, "sha1")
+}
+
+func TestFetchAfterSubmoduleRemovalSHA256(t *testing.T) {
+	testFetchAfterSubmoduleRemoval(t, "sha256")
+}
+
 func testRepeatedFetch(t *testing.T, keepGitDir bool, format string) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
@@ -175,6 +183,66 @@ func testRepeatedFetch(t *testing.T, keepGitDir bool, format string) {
 	require.Equal(t, pin3, pin4)
 }
 
+func testFetchAfterSubmoduleRemoval(t *testing.T, format string) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := logProgressStreams(context.Background(), t)
+
+	gs := setupGitSource(t, t.TempDir())
+	repo := setupGitRepo(t, format)
+
+	id := &GitIdentifier{Remote: repo.mainURL, Ref: "feature"}
+
+	g, err := gs.Resolve(ctx, id, nil, nil)
+	require.NoError(t, err)
+
+	key1, pin1, _, done, err := g.CacheKey(ctx, nil, 0)
+	require.NoError(t, err)
+	require.True(t, done)
+
+	ref1, err := g.Snapshot(ctx, nil)
+	require.NoError(t, err)
+	defer ref1.Release(context.TODO())
+
+	runShell(t, repo.mainPath,
+		"git checkout feature",
+		"git submodule deinit -f sub",
+		"git rm sub",
+		"git commit -m removesub",
+	)
+
+	g, err = gs.Resolve(ctx, id, nil, nil)
+	require.NoError(t, err)
+
+	key2, pin2, _, done, err := g.CacheKey(ctx, nil, 0)
+	require.NoError(t, err)
+	require.True(t, done)
+	require.NotEqual(t, key1, key2)
+	require.NotEqual(t, pin1, pin2)
+
+	ref2, err := g.Snapshot(ctx, nil)
+	require.NoError(t, err)
+	defer ref2.Release(context.TODO())
+
+	mount, err := ref2.Mount(ctx, true, nil)
+	require.NoError(t, err)
+
+	lm := snapshot.LocalMounter(mount)
+	dir, err := lm.Mount()
+	require.NoError(t, err)
+	defer lm.Unmount()
+
+	dt, err := os.ReadFile(filepath.Join(dir, "ghi"))
+	require.NoError(t, err)
+	require.Equal(t, "baz\n", string(dt))
+
+	_, err = os.Lstat(filepath.Join(dir, "sub"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
 func TestFetchBySHA1(t *testing.T) {
 	testFetchBySHA(t, "sha1", false)
 }
@@ -201,7 +269,7 @@ func testFetchBySHA(t *testing.T, format string, keepGitDir bool) {
 
 	repo := setupGitRepo(t, format)
 
-	cmd := exec.Command("git", "rev-parse", "feature")
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "feature")
 	cmd.Dir = repo.mainPath
 
 	out, err := cmd.Output()
@@ -323,7 +391,7 @@ func testFetchUnreferencedRefSha(t *testing.T, ref string, keepGitDir bool, form
 
 	repo := setupGitRepo(t, format)
 
-	cmd := exec.Command("git", "rev-parse", ref)
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", ref)
 	cmd.Dir = repo.mainPath
 
 	out, err := cmd.Output()
@@ -522,7 +590,7 @@ func testFetchByTag(t *testing.T, tag, expectedCommitSubject string, isAnnotated
 	id := &GitIdentifier{Remote: repo.mainURL, Ref: tag, KeepGitDir: keepGitDir}
 
 	if checksumMode != testChecksumModeNone {
-		cmd := exec.Command("git", "rev-parse", tag)
+		cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", tag)
 		cmd.Dir = repo.mainPath
 
 		out, err := cmd.Output()
@@ -666,7 +734,7 @@ func testFetchAnnotatedTagAfterClone(t *testing.T, format string) {
 	ctx = logProgressStreams(ctx, t)
 
 	repo := setupGitRepo(t, format)
-	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "HEAD")
 	cmd.Dir = repo.mainPath
 
 	out, err := cmd.Output()
@@ -739,7 +807,7 @@ func testFetchAnnotatedTagChecksums(t *testing.T, format string, keepGitDir bool
 	ctx = logProgressStreams(ctx, t)
 
 	repo := setupGitRepo(t, format)
-	cmd := exec.Command("git", "rev-parse", "v1.2.3")
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "v1.2.3")
 	cmd.Dir = repo.mainPath
 
 	out, err := cmd.Output()
@@ -753,7 +821,7 @@ func testFetchAnnotatedTagChecksums(t *testing.T, format string, keepGitDir bool
 	require.Equal(t, expLen, len(shaTag))
 
 	// make sure this is an annotated tag
-	cmd = exec.Command("git", "cat-file", "-t", shaTag)
+	cmd = exec.CommandContext(context.TODO(), "git", "cat-file", "-t", shaTag)
 	cmd.Dir = repo.mainPath
 
 	out, err = cmd.Output()
@@ -761,7 +829,7 @@ func testFetchAnnotatedTagChecksums(t *testing.T, format string, keepGitDir bool
 	require.Equal(t, "tag\n", string(out))
 
 	// get commit that the tag points to
-	cmd = exec.Command("git", "rev-parse", "v1.2.3^{}")
+	cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "v1.2.3^{}")
 	cmd.Dir = repo.mainPath
 
 	out, err = cmd.Output()
@@ -818,14 +886,14 @@ func testFetchAnnotatedTagChecksums(t *testing.T, format string, keepGitDir bool
 			require.NoError(t, err)
 			defer lm1.Unmount()
 
-			cmd = exec.Command("git", "tag", "--points-at", "HEAD")
+			cmd = exec.CommandContext(context.TODO(), "git", "tag", "--points-at", "HEAD")
 			cmd.Dir = dir
 
 			out, err = cmd.Output()
 			require.NoError(t, err)
 			require.Equal(t, "v1.2.3\n", string(out))
 
-			cmd = exec.Command("git", "rev-parse", "v1.2.3")
+			cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "v1.2.3")
 			cmd.Dir = dir
 
 			out, err = cmd.Output()
@@ -858,7 +926,7 @@ func testFetchTagChangeRace(t *testing.T, format string, keepGitDir bool) {
 		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
 	}
 	repo := setupGitRepo(t, format)
-	cmd := exec.Command("git", "rev-parse", "v1.2.3")
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "v1.2.3")
 	cmd.Dir = repo.mainPath
 
 	out, err := cmd.Output()
@@ -871,7 +939,7 @@ func testFetchTagChangeRace(t *testing.T, format string, keepGitDir bool) {
 	shaTag := strings.TrimSpace(string(out))
 	require.Equal(t, expLen, len(shaTag))
 
-	cmd = exec.Command("git", "rev-parse", "v1.2.3^{}")
+	cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "v1.2.3^{}")
 	cmd.Dir = repo.mainPath
 
 	out, err = cmd.Output()
@@ -896,7 +964,7 @@ func testFetchTagChangeRace(t *testing.T, format string, keepGitDir bool) {
 		require.Equal(t, shaTagCommit, key1)
 	}
 
-	cmd = exec.Command("git", "rev-parse", "v1.2.3-special")
+	cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "v1.2.3-special")
 	cmd.Dir = repo.mainPath
 	out, err = cmd.Output()
 	require.NoError(t, err)
@@ -904,13 +972,13 @@ func testFetchTagChangeRace(t *testing.T, format string, keepGitDir bool) {
 	require.NotEqual(t, shaTag, shaTagNew)
 
 	// delete tag v1.2.3
-	cmd = exec.Command("git", "tag", "-d", "v1.2.3")
+	cmd = exec.CommandContext(context.TODO(), "git", "tag", "-d", "v1.2.3")
 	cmd.Dir = repo.mainPath
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
 	// recreate tag v1.2.3 to point to another commit
-	cmd = exec.Command("git", "tag", "v1.2.3", shaTagNew)
+	cmd = exec.CommandContext(context.TODO(), "git", "tag", "v1.2.3", shaTagNew)
 	cmd.Dir = repo.mainPath
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
@@ -934,7 +1002,7 @@ func testFetchTagChangeRace(t *testing.T, format string, keepGitDir bool) {
 
 	if keepGitDir {
 		// read current HEAD commit
-		cmd = exec.Command("git", "rev-parse", "HEAD")
+		cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "HEAD")
 		cmd.Dir = dir
 
 		out, err = cmd.Output()
@@ -966,7 +1034,7 @@ func testFetchBranchChangeRace(t *testing.T, format string, keepGitDir bool) {
 		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
 	}
 	repo := setupGitRepo(t, format)
-	cmd := exec.Command("git", "rev-parse", "master")
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "master")
 	cmd.Dir = repo.mainPath
 
 	out, err := cmd.Output()
@@ -996,7 +1064,7 @@ func testFetchBranchChangeRace(t *testing.T, format string, keepGitDir bool) {
 		require.Equal(t, shaMaster, key1)
 	}
 
-	cmd = exec.Command("git", "rev-parse", "feature")
+	cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "feature")
 	cmd.Dir = repo.mainPath
 	out, err = cmd.Output()
 	require.NoError(t, err)
@@ -1004,7 +1072,7 @@ func testFetchBranchChangeRace(t *testing.T, format string, keepGitDir bool) {
 	require.NotEqual(t, shaMaster, shaFeature)
 
 	// checkout feature as master
-	cmd = exec.Command("git", "checkout", "-B", "master", "feature")
+	cmd = exec.CommandContext(context.TODO(), "git", "checkout", "-B", "master", "feature")
 	cmd.Dir = repo.mainPath
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
@@ -1028,7 +1096,7 @@ func testFetchBranchChangeRace(t *testing.T, format string, keepGitDir bool) {
 
 	if keepGitDir {
 		// read current HEAD commit
-		cmd = exec.Command("git", "rev-parse", "HEAD")
+		cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "HEAD")
 		cmd.Dir = dir
 
 		out, err = cmd.Output()
@@ -1060,7 +1128,7 @@ func testFetchBranchRemoveRace(t *testing.T, format string, keepGitDir bool) {
 		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
 	}
 	repo := setupGitRepo(t, format)
-	cmd := exec.Command("git", "rev-parse", "feature")
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "feature")
 	cmd.Dir = repo.mainPath
 
 	out, err := cmd.Output()
@@ -1090,7 +1158,7 @@ func testFetchBranchRemoveRace(t *testing.T, format string, keepGitDir bool) {
 		require.Equal(t, shaFeature, key1)
 	}
 
-	cmd = exec.Command("git", "rev-parse", "master")
+	cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "master")
 	cmd.Dir = repo.mainPath
 	out, err = cmd.Output()
 	require.NoError(t, err)
@@ -1098,22 +1166,22 @@ func testFetchBranchRemoveRace(t *testing.T, format string, keepGitDir bool) {
 	require.NotEqual(t, shaMaster, shaFeature)
 
 	// change feature to point to master
-	cmd = exec.Command("git", "branch", "-f", "feature", "master")
+	cmd = exec.CommandContext(context.TODO(), "git", "branch", "-f", "feature", "master")
 	cmd.Dir = repo.mainPath
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	cmd = exec.Command("git", "reflog", "expire", "--expire-unreachable=now", "--expire=now", "--all")
+	cmd = exec.CommandContext(context.TODO(), "git", "reflog", "expire", "--expire-unreachable=now", "--expire=now", "--all")
 	cmd.Dir = repo.mainPath
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	cmd = exec.Command("git", "gc", "--prune=now", "--aggressive")
+	cmd = exec.CommandContext(context.TODO(), "git", "gc", "--prune=now", "--aggressive")
 	cmd.Dir = repo.mainPath
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	cmd = exec.Command("git", "cat-file", "-t", shaFeature)
+	cmd = exec.CommandContext(context.TODO(), "git", "cat-file", "-t", shaFeature)
 	cmd.Dir = repo.mainPath
 	out, err = cmd.CombinedOutput()
 	require.Error(t, err, string(out))
@@ -1145,7 +1213,7 @@ func testFetchMutatedTag(t *testing.T, format string, keepGitDir bool) {
 		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
 	}
 	repo := setupGitRepo(t, format)
-	cmd := exec.Command("git", "rev-parse", "v1.2.3")
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "v1.2.3")
 	cmd.Dir = repo.mainPath
 
 	out, err := cmd.Output()
@@ -1173,13 +1241,13 @@ func testFetchMutatedTag(t *testing.T, format string, keepGitDir bool) {
 	ref.Release(context.TODO())
 
 	// mutate the tag to point to another commit
-	cmd = exec.Command("git", "tag", "-f", "v1.2.3", "feature")
+	cmd = exec.CommandContext(context.TODO(), "git", "tag", "-f", "v1.2.3", "feature")
 	cmd.Dir = repo.mainPath
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
 	// verify that the tag now points to a different commit
-	cmd = exec.Command("git", "rev-parse", "v1.2.3")
+	cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "v1.2.3")
 	cmd.Dir = repo.mainPath
 
 	out, err = cmd.Output()
@@ -1231,7 +1299,7 @@ func testFetchMutatedBranch(t *testing.T, format string, keepGitDir bool) {
 		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
 	}
 	repo := setupGitRepo(t, format)
-	cmd := exec.Command("git", "rev-parse", "feature")
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "feature")
 	cmd.Dir = repo.mainPath
 
 	out, err := cmd.Output()
@@ -1259,12 +1327,12 @@ func testFetchMutatedBranch(t *testing.T, format string, keepGitDir bool) {
 	ref.Release(context.TODO())
 
 	// mutate the branch to point to become parent dir
-	cmd = exec.Command("git", "branch", "-D", "feature")
+	cmd = exec.CommandContext(context.TODO(), "git", "branch", "-D", "feature")
 	cmd.Dir = repo.mainPath
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	cmd = exec.Command("git", "branch", "feature/new", shaBranch)
+	cmd = exec.CommandContext(context.TODO(), "git", "branch", "feature/new", shaBranch)
 	cmd.Dir = repo.mainPath
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
@@ -1732,18 +1800,30 @@ func testCheckSignatures(t *testing.T, keepGitDir bool, format string) {
 
 	fixturesBase := os.Getenv("BUILDKIT_TEST_SIGN_FIXTURES")
 
-	pubkey, err := os.ReadFile(fixturesBase + "/user1.gpg.pub")
+	user1GPGPub, err := os.ReadFile(fixturesBase + "/user1.gpg.pub")
 	require.NoError(t, err)
 
-	err = gitsign.VerifySignature(ob, pubkey, nil)
+	err = gitsign.VerifySignature(ob, user1GPGPub, nil)
 	require.NoError(t, err)
 
-	pubkey, err = os.ReadFile(fixturesBase + "/user2.gpg.pub")
+	user2GPGPub, err := os.ReadFile(fixturesBase + "/user2.gpg.pub")
 	require.NoError(t, err)
 
-	err = gitsign.VerifySignature(ob, pubkey, nil)
+	err = gitsign.VerifySignature(ob, user2GPGPub, nil)
 	require.ErrorContains(t, err, "signature made by unknown entity")
 	require.ErrorContains(t, err, "signature by")
+
+	mergedWrongFirst := append(append([]byte{}, user2GPGPub...), '\n')
+	mergedWrongFirst = append(mergedWrongFirst, user1GPGPub...)
+
+	err = gitsign.VerifySignature(ob, mergedWrongFirst, nil)
+	require.NoError(t, err)
+
+	mergedRightFirst := append(append([]byte{}, user1GPGPub...), '\n')
+	mergedRightFirst = append(mergedRightFirst, user2GPGPub...)
+
+	err = gitsign.VerifySignature(ob, mergedRightFirst, nil)
+	require.NoError(t, err)
 
 	id = &GitIdentifier{Remote: repo.mainURL, KeepGitDir: keepGitDir, Ref: "v1.2.3"}
 
@@ -2258,7 +2338,7 @@ func serveGitRepo(t *testing.T, root string) string {
 	t.Helper()
 	gitpath, err := exec.LookPath("git")
 	require.NoError(t, err)
-	gitversion, _ := exec.Command(gitpath, "version").CombinedOutput()
+	gitversion, _ := exec.CommandContext(context.TODO(), gitpath, "version").CombinedOutput()
 	t.Logf("%s", gitversion) // E.g. "git version 2.30.2"
 
 	// Serve all repositories under root using the Smart HTTP protocol so
@@ -2306,9 +2386,9 @@ func runShellEnv(t *testing.T, dir string, env []string, cmds ...string) {
 	for _, args := range cmds {
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
-			cmd = exec.Command("powershell", "-command", args)
+			cmd = exec.CommandContext(context.TODO(), "powershell", "-command", args)
 		} else {
-			cmd = exec.Command("sh", "-c", args)
+			cmd = exec.CommandContext(context.TODO(), "sh", "-c", args)
 		}
 		cmd.Dir = dir
 		cmd.Env = append(os.Environ(), env...)
@@ -2352,4 +2432,138 @@ func logProgressStreams(ctx context.Context, t *testing.T) context.Context {
 		}
 	}()
 	return ctx
+}
+
+func TestResetSnapshotMtimes(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	// Create a tree:
+	//   dir/
+	//   dir/file.txt
+	//   dir/subdir/
+	//   dir/subdir/nested.txt
+	//   dir/link -> file.txt  (symlink)
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "subdir"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "file.txt"), []byte("hello"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "subdir", "nested.txt"), []byte("world"), 0644))
+	require.NoError(t, os.Symlink("file.txt", filepath.Join(dir, "link")))
+
+	target := time.Date(2023, 6, 15, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, resetSnapshotMtimes(dir, target))
+
+	// Regular files should have mtime set
+	fi, err := os.Lstat(filepath.Join(dir, "file.txt"))
+	require.NoError(t, err)
+	require.Equal(t, target, fi.ModTime().UTC())
+
+	fi, err = os.Lstat(filepath.Join(dir, "subdir", "nested.txt"))
+	require.NoError(t, err)
+	require.Equal(t, target, fi.ModTime().UTC())
+
+	// Directories should have mtime set
+	fi, err = os.Lstat(dir)
+	require.NoError(t, err)
+	require.Equal(t, target, fi.ModTime().UTC())
+
+	fi, err = os.Lstat(filepath.Join(dir, "subdir"))
+	require.NoError(t, err)
+	require.Equal(t, target, fi.ModTime().UTC())
+
+	// Symlink itself should have mtime set via lutimes
+	fi, err = os.Lstat(filepath.Join(dir, "link"))
+	require.NoError(t, err)
+	require.Equal(t, target, fi.ModTime().UTC())
+
+	// Verify symlink itself still exists and points correctly
+	linkTarget, err := os.Readlink(filepath.Join(dir, "link"))
+	require.NoError(t, err)
+	require.Equal(t, "file.txt", linkTarget)
+}
+
+func TestCommitTimeMtimesSHA1(t *testing.T) {
+	testCommitTimeMtimes(t, "sha1", false)
+}
+
+func TestCommitTimeMtimesKeepGitDirSHA1(t *testing.T) {
+	testCommitTimeMtimes(t, "sha1", true)
+}
+
+func TestCommitTimeMtimesSHA256(t *testing.T) {
+	testCommitTimeMtimes(t, "sha256", false)
+}
+
+func TestCommitTimeMtimesKeepGitDirSHA256(t *testing.T) {
+	testCommitTimeMtimes(t, "sha256", true)
+}
+
+func testCommitTimeMtimes(t *testing.T, format string, keepGitDir bool) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := logProgressStreams(context.Background(), t)
+
+	gs := setupGitSource(t, t.TempDir())
+	repo := setupGitRepo(t, format)
+
+	// Get the commit timestamp of the master branch
+	cmd := exec.CommandContext(ctx, "git", "log", "-1", "--format=%ct", "master^{commit}")
+	cmd.Dir = repo.mainPath
+	out, err := cmd.Output()
+	require.NoError(t, err)
+	ts, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	require.NoError(t, err)
+	expectedTime := time.Unix(ts, 0)
+
+	// Snapshot without MTime=commit
+	idDefault := &GitIdentifier{Remote: repo.mainURL, KeepGitDir: keepGitDir}
+	gDefault, err := gs.Resolve(ctx, idDefault, nil, nil)
+	require.NoError(t, err)
+	keyDefault, _, _, _, err := gDefault.CacheKey(ctx, nil, 0)
+	require.NoError(t, err)
+
+	// Snapshot with MTime=commit
+	idCommit := &GitIdentifier{Remote: repo.mainURL, KeepGitDir: keepGitDir, MTime: "commit"}
+	gCommit, err := gs.Resolve(ctx, idCommit, nil, nil)
+	require.NoError(t, err)
+	keyCommit, _, _, _, err := gCommit.CacheKey(ctx, nil, 0)
+	require.NoError(t, err)
+
+	// Cache keys must differ
+	require.NotEqual(t, keyDefault, keyCommit)
+	require.Contains(t, keyCommit, "(mtime=commit)")
+
+	refCommit, err := gCommit.Snapshot(ctx, nil)
+	require.NoError(t, err)
+	defer refCommit.Release(context.TODO())
+
+	mount, err := refCommit.Mount(ctx, true, nil)
+	require.NoError(t, err)
+	lm := snapshot.LocalMounter(mount)
+	dir, err := lm.Mount()
+	require.NoError(t, err)
+	defer lm.Unmount()
+
+	// Verify file mtimes match the commit timestamp
+	fi, err := os.Lstat(filepath.Join(dir, "abc"))
+	require.NoError(t, err)
+	require.Equal(t, expectedTime.Unix(), fi.ModTime().Unix(), "file mtime should match commit time")
+
+	fi, err = os.Lstat(filepath.Join(dir, "def"))
+	require.NoError(t, err)
+	require.Equal(t, expectedTime.Unix(), fi.ModTime().Unix(), "file mtime should match commit time")
+
+	// Verify directory mtime
+	fi, err = os.Lstat(dir)
+	require.NoError(t, err)
+	require.Equal(t, expectedTime.Unix(), fi.ModTime().Unix(), "dir mtime should match commit time")
+
+	if keepGitDir {
+		// .git directory should also have normalized mtime
+		fi, err = os.Lstat(filepath.Join(dir, ".git"))
+		require.NoError(t, err)
+		require.Equal(t, expectedTime.Unix(), fi.ModTime().Unix(), ".git dir mtime should match commit time")
+	}
 }

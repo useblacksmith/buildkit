@@ -41,7 +41,7 @@ import (
 	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/runc"
 	"github.com/moby/sys/userns"
-	"github.com/pelletier/go-toml"
+	"github.com/pelletier/go-toml/v2"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
@@ -422,11 +422,11 @@ func snapshotterFactory(commonRoot string, cfg config.OCIConfig, sm *session.Man
 			// the main BuildKit config, the main config Unmarshalls it into a
 			// generic map[string]interface{}. Here we convert it back into TOML
 			// tree, and unmarshal it to the actual type.
-			t, err := toml.TreeFromMap(cfg.StargzSnapshotterConfig)
+			b, err := toml.Marshal(cfg.StargzSnapshotterConfig)
 			if err != nil {
 				return snFactory, errors.Wrapf(err, "failed to parse stargz config")
 			}
-			err = t.Unmarshal(&sgzCfg)
+			err = toml.Unmarshal(b, &sgzCfg)
 			if err != nil {
 				return snFactory, errors.Wrapf(err, "failed to parse stargz config")
 			}
@@ -525,7 +525,7 @@ func sourceWithSession(hosts docker.RegistryHosts, sm *session.Manager) sgzsourc
 			// Get source information based on labels and RegistryHosts containing
 			// session-based authorizer.
 			parse := sgzsource.FromDefaultLabels(func(ref reference.Spec) ([]docker.RegistryHost, error) {
-				return resolver.DefaultPool.GetResolver(hosts, named.String(), "pull", sm, session.NewGroup(sids...)).
+				return resolver.DefaultPool.GetResolver(hosts, named.String(), resolver.ScopeType{}, sm, session.NewGroup(sids...)).
 					HostsFunc(ref.Hostname())
 			})
 			if s, err := parse(map[string]string{

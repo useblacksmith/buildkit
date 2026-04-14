@@ -58,6 +58,7 @@ import (
 	"github.com/moby/buildkit/session/secrets/secretsprovider"
 	"github.com/moby/buildkit/session/sshforward/sshprovider"
 	"github.com/moby/buildkit/solver/errdefs"
+	provenancetypes "github.com/moby/buildkit/solver/llbsolver/provenance/types"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/solver/result"
 	"github.com/moby/buildkit/sourcepolicy"
@@ -66,6 +67,8 @@ import (
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/gitutil/gitobject"
+	"github.com/moby/buildkit/util/iohelper"
+	"github.com/moby/buildkit/util/purl"
 	"github.com/moby/buildkit/util/testutil"
 	containerdutil "github.com/moby/buildkit/util/testutil/containerd"
 	"github.com/moby/buildkit/util/testutil/echoserver"
@@ -73,8 +76,10 @@ import (
 	"github.com/moby/buildkit/util/testutil/httpserver"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/moby/buildkit/util/testutil/workers"
+	policyimage "github.com/moby/policy-helpers/image"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
+	packageurl "github.com/package-url/packageurl-go"
 	"github.com/pkg/errors"
 	"github.com/spdx/tools-golang/spdx"
 	"github.com/stretchr/testify/assert"
@@ -96,12 +101,6 @@ func init() {
 	}
 }
 
-type nopWriteCloser struct {
-	io.Writer
-}
-
-func (nopWriteCloser) Close() error { return nil }
-
 var allTests = []func(t *testing.T, sb integration.Sandbox){
 	testCacheExportCacheKeyLoop,
 	testRelativeWorkDir,
@@ -119,6 +118,7 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 	testBuildHTTPSourceAuthHeaderSecret,
 	testBuildHTTPSourceHostTokenSecret,
 	testBuildHTTPSourceHeader,
+	testBuildHTTPSourcePGPSignatureVerify,
 	testBuildPushAndValidate,
 	testBuildExportWithUncompressed,
 	testBuildExportScratch,
@@ -163,6 +163,7 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 	testHostnameLookup,
 	testHostnameSpecifying,
 	testPushByDigest,
+	testPushProgressSameVertex,
 	testPullWithDigestCheck,
 	testBasicInlineCacheImportExport,
 	testExportBusyboxLocal,
@@ -232,10 +233,11 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 	testMultipleRecordsWithSameLayersCacheImportExport,
 	testRegistryEmptyCacheExport,
 	testSnapshotWithMultipleBlobs,
+	testImageBlobSource,
+	testOCILayoutBlobSource,
 	testExportLocalNoPlatformSplit,
 	testExportLocalNoPlatformSplitOverwrite,
 	testExportLocalForcePlatformSplit,
-	testSolverOptLocalDirsStillWorks,
 	testOCIIndexMediatype,
 	testLayerLimitOnMounts,
 	testFrontendVerifyPlatforms,
@@ -251,10 +253,17 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 	testHTTPResolveMultiBuild,
 	testGitResolveMutatedSource,
 	testImageResolveAttestationChainRequiresNetwork,
+	testImageResolveAttestationChainLocal,
+	testImageResolveProvenanceAttestation,
 	testSourcePolicySession,
+	testSourcePolicySessionDenyMessages,
 	testSourceMetaPolicySession,
+	testSourceMetaPolicySessionResolveAttestations,
 	testSourcePolicyParallelSession,
 	testSourcePolicySignedCommit,
+	testSourcePolicySessionHTTPChecksumAssist,
+	testSourcePolicySessionConvert,
+	testListenBuildHistoryExcludesSoftDeletedRecords,
 }
 
 func TestIntegration(t *testing.T) {
@@ -747,6 +756,9 @@ func testExportBusyboxLocal(t *testing.T, sb integration.Sandbox) {
 	destDir := t.TempDir()
 
 	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		FrontendAttrs: map[string]string{
+			"attest:provenance": "",
+		},
 		Exports: []ExportEntry{
 			{
 				Type:      ExporterLocal,
@@ -1020,7 +1032,8 @@ func testRawSocketMount(t *testing.T, sb integration.Sandbox) {
 
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "test.sock")
-	l, err := net.Listen("unix", sockPath)
+	listener := net.ListenConfig{}
+	l, err := listener.Listen(context.TODO(), "unix", sockPath)
 	require.NoError(t, err)
 	defer l.Close()
 
@@ -1066,8 +1079,15 @@ func testRawSocketMount(t *testing.T, sb integration.Sandbox) {
 	require.True(t, called.Load(), "server should have been called")
 }
 
+/*
+testExtraHosts verifies that custom host entries added via llb.AddExtraHost() are resolvable
+during a RUN step. It adds "myhost" pointing to 1.2.3.4 and checks /etc/hosts for the entry.
+
+Skipped on Windows because BuildKit for Windows does not support llb.AddExtraHost()
+at the moment due to fundamental differences in how Linux and Windows containers handle hosts file injections
+*/
 func testExtraHosts(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
+	integration.SkipOnPlatform(t, "windows", "extra hosts not supported on BuildKit for Windows at the moment")
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
@@ -1295,6 +1315,99 @@ func testPushByDigest(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, resp.ExporterResponse[exptypes.ExporterImageDigestKey], desc.Digest.String())
 	require.Equal(t, images.MediaTypeDockerSchema2Manifest, desc.MediaType)
 	require.Greater(t, desc.Size, int64(0))
+}
+
+func testPushProgressSameVertex(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	requiresLinux(t)
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	st := llb.Scratch().File(llb.Mkfile("foo", 0600, []byte("data")))
+	def, err := st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	imageName := registry + "/foo/bar:latest"
+
+	var vertexes []*Vertex
+	var statuses []*VertexStatus
+	ch := make(chan *SolveStatus)
+	eg, ctx := errgroup.WithContext(sb.Context())
+	eg.Go(func() error {
+		for {
+			select {
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			case ss, ok := <-ch:
+				if !ok {
+					return nil
+				}
+				vertexes = append(vertexes, ss.Vertexes...)
+				statuses = append(statuses, ss.Statuses...)
+			}
+		}
+	})
+	eg.Go(func() error {
+		_, err := c.Solve(ctx, def, SolveOpt{
+			Exports: []ExportEntry{
+				{
+					Type: "image",
+					Attrs: map[string]string{
+						"name": imageName,
+						"push": "true",
+					},
+				},
+			},
+		}, ch)
+		return err
+	})
+	require.NoError(t, eg.Wait())
+
+	exportVertexes := map[digest.Digest]struct{}{}
+	pushVertexes := map[digest.Digest]struct{}{}
+	pushManifestPrefix := "pushing manifest for " + imageName + "@"
+
+	for _, v := range vertexes {
+		if v.Name == "exporting to image" {
+			exportVertexes[v.Digest] = struct{}{}
+		}
+	}
+
+	for _, st := range statuses {
+		switch {
+		case st.ID == "pushing layers":
+			pushVertexes[st.Vertex] = struct{}{}
+		case strings.HasPrefix(st.ID, pushManifestPrefix):
+			pushVertexes[st.Vertex] = struct{}{}
+		}
+	}
+
+	require.Len(t, exportVertexes, 1, "expected exactly one export vertex in status stream")
+	require.NotEmpty(t, pushVertexes, "expected at least one push status in status stream")
+
+	var exportVertex digest.Digest
+	for v := range exportVertexes {
+		exportVertex = v
+	}
+	for v := range pushVertexes {
+		require.Equal(t, exportVertex, v, "push statuses should use the same vertex as exporting to image")
+	}
+
+	hasPushManifest := false
+	for _, st := range statuses {
+		if strings.HasPrefix(st.ID, pushManifestPrefix) {
+			hasPushManifest = true
+			require.Equal(t, exportVertex, st.Vertex, "pushing manifest should use the same vertex as exporting to image")
+		}
+	}
+	require.True(t, hasPushManifest, "expected pushing manifest status in status stream")
 }
 
 func testPullWithDigestCheck(t *testing.T, sb integration.Sandbox) {
@@ -1706,12 +1819,35 @@ func testFrontendImageNaming(t *testing.T, sb integration.Sandbox) {
 	checkAllReleasable(t, c, sb, true)
 }
 
+/*
+testSecretMounts verifies file-based secret mounts: content readability, optional/required
+behavior, custom permissions, and empty secrets. Skipped on Windows because BuildKit uses
+tmpfs for secret mounts, which Windows does not support. See testSecretEnv for a
+cross-platform alternative using environment-based secrets.
+*/
 func testSecretMounts(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
+	// Windows vs Linux secret implementation differences:
+	//
+	// Linux: Secrets are mounted as files using tmpfs at /run/secrets/ (RAM-based, encrypted)
+	//
+	// Windows: Secrets are stored in C:\ProgramData\Docker\internal\secrets (clear text on disk)
+	//          Symbolic links point to the desired target (default: C:\ProgramData\Docker\secrets)
+	//          Windows does NOT support tmpfs or non-directory file bind-mounts
+	//          UID/GID/mode options are NOT supported on Windows
+	//          Recommend BitLocker for at-rest encryption
+	//
+	// BuildKit Issue: The "invalid windows mount type: 'tmpfs'" error occurs because BuildKit
+	// currently tries to use tmpfs for all secret mounts. This needs to be fixed in BuildKit's
+	// secret mount implementation to use the Windows symlink approach instead.
+
+	// For now, this test is Linux-only until BuildKit properly implements Windows secret mounts
+	// without tmpfs. Use testSecretEnv for Windows-compatible environment-based secrets.
+	integration.SkipOnPlatform(t, "windows", "Windows does not support tmpfs for secret mounts")
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
+	// Test 1: Basic secret mount with content verification (Linux only)
 	st := llb.Image("busybox:latest").
 		Run(llb.Shlex(`sh -c 'mount | grep mysecret | grep "type tmpfs" && [ "$(cat /run/secrets/mysecret)" = 'foo-secret' ]'`), llb.AddSecret("/run/secrets/mysecret"))
 
@@ -1725,7 +1861,7 @@ func testSecretMounts(t *testing.T, sb integration.Sandbox) {
 	}, nil)
 	require.NoError(t, err)
 
-	// test optional, mount should not exist when secret not present in SolveOpt
+	// Test 2: Optional secret - mount should not exist when secret not present in SolveOpt
 	st = llb.Image("busybox:latest").
 		Run(llb.Shlex(`test ! -f /run/secrets/mysecret2`), llb.AddSecret("/run/secrets/mysecret2", llb.SecretOptional))
 
@@ -1740,6 +1876,7 @@ func testSecretMounts(t *testing.T, sb integration.Sandbox) {
 	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
 	require.NoError(t, err)
 
+	// Test 3: Required secret missing - should error
 	st = llb.Image("busybox:latest").
 		Run(llb.Shlex(`echo secret3`), llb.AddSecret("/run/secrets/mysecret3"))
 
@@ -1751,7 +1888,7 @@ func testSecretMounts(t *testing.T, sb integration.Sandbox) {
 	}, nil)
 	require.Error(t, err)
 
-	// test id,perm,uid
+	// Test 4: Secret with custom ID and file permissions
 	st = llb.Image("busybox:latest").
 		Run(llb.Shlex(`sh -c '[ "$(stat -c "%u %g %f" /run/secrets/mysecret4)" = "1 1 81ff" ]' `), llb.AddSecret("/run/secrets/mysecret4", llb.SecretID("mysecret"), llb.SecretFileOpt(1, 1, 0777)))
 
@@ -1765,7 +1902,7 @@ func testSecretMounts(t *testing.T, sb integration.Sandbox) {
 	}, nil)
 	require.NoError(t, err)
 
-	// test empty cert still creates secret file
+	// Test 5: Empty secret still creates secret file
 	st = llb.Image("busybox:latest").
 		Run(llb.Shlex(`test -f /run/secrets/mysecret5`), llb.AddSecret("/run/secrets/mysecret5", llb.SecretID("mysecret")))
 
@@ -1780,14 +1917,30 @@ func testSecretMounts(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 }
 
+/*
+testSecretEnv verifies that secrets can be injected as environment variables during a build.
+It tests four scenarios: (1) a provided secret is accessible via env var, (2) an optional
+secret that is not provided results in an unset/empty env var, (3) a required secret that
+is not provided causes an error, and (4) multiple secrets with custom IDs are resolved correctly.
+Works on both Linux (busybox) and Windows (nanoserver).
+*/
 func testSecretEnv(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	st := llb.Image("busybox:latest").
-		Run(llb.Shlex(`sh -c '[ "$(echo ${MY_SECRET})" = 'foo-secret' ]'`), llb.AddSecret("MY_SECRET", llb.SecretAsEnv(true)))
+	imgName := integration.UnixOrWindows("busybox:latest", "nanoserver:latest")
+	var st llb.ExecState
+
+	// Test 1: Verify secret value is accessible as environment variable
+	switch imgName {
+	case "nanoserver:latest":
+		st = llb.Image(imgName).
+			Run(llb.Shlex(`cmd /C "if "%MY_SECRET%"=="foo-secret" (exit 0) else (exit 1)"`), llb.AddSecret("MY_SECRET", llb.SecretAsEnv(true)))
+	case "busybox:latest":
+		st = llb.Image(imgName).
+			Run(llb.Shlex(`sh -c '[ "$(echo ${MY_SECRET})" = 'foo-secret' ]'`), llb.AddSecret("MY_SECRET", llb.SecretAsEnv(true)))
+	}
 
 	def, err := st.Marshal(sb.Context())
 	require.NoError(t, err)
@@ -1799,9 +1952,15 @@ func testSecretEnv(t *testing.T, sb integration.Sandbox) {
 	}, nil)
 	require.NoError(t, err)
 
-	// test optional
-	st = llb.Image("busybox:latest").
-		Run(llb.Shlex(`sh -c '[ -z "${MY_SECRET}" ]'`), llb.AddSecret("MY_SECRET", llb.SecretAsEnv(true), llb.SecretOptional))
+	// Test 2: Optional secret not provided should be unset/empty
+	switch imgName {
+	case "nanoserver:latest":
+		st = llb.Image(imgName).
+			Run(llb.Shlex(`cmd /C "if not defined MY_SECRET (exit 0) else (exit 1)"`), llb.AddSecret("MY_SECRET", llb.SecretAsEnv(true), llb.SecretOptional))
+	case "busybox:latest":
+		st = llb.Image(imgName).
+			Run(llb.Shlex(`sh -c '[ -z "${MY_SECRET}" ]'`), llb.AddSecret("MY_SECRET", llb.SecretAsEnv(true), llb.SecretOptional))
+	}
 
 	def, err = st.Marshal(sb.Context())
 	require.NoError(t, err)
@@ -1814,8 +1973,15 @@ func testSecretEnv(t *testing.T, sb integration.Sandbox) {
 	_, err = c.Solve(sb.Context(), def, SolveOpt{}, nil)
 	require.NoError(t, err)
 
-	st = llb.Image("busybox:latest").
-		Run(llb.Shlex(`echo foo`), llb.AddSecret("MY_SECRET", llb.SecretAsEnv(true)))
+	// Test 3: Required secret not provided should error
+	switch imgName {
+	case "nanoserver:latest":
+		st = llb.Image(imgName).
+			Run(llb.Shlex(`cmd /C "echo foo"`), llb.AddSecret("MY_SECRET", llb.SecretAsEnv(true)))
+	case "busybox:latest":
+		st = llb.Image(imgName).
+			Run(llb.Shlex(`echo foo`), llb.AddSecret("MY_SECRET", llb.SecretAsEnv(true)))
+	}
 
 	def, err = st.Marshal(sb.Context())
 	require.NoError(t, err)
@@ -1825,12 +1991,21 @@ func testSecretEnv(t *testing.T, sb integration.Sandbox) {
 	}, nil)
 	require.Error(t, err)
 
-	// test id
-	st = llb.Image("busybox:latest").
-		Run(llb.Shlex(`sh -c '[ "$(echo ${MYPASSWORD}-${MYTOKEN})" = "pw-token" ]' `),
-			llb.AddSecret("MYPASSWORD", llb.SecretID("pass"), llb.SecretAsEnv(true)),
-			llb.AddSecret("MYTOKEN", llb.SecretAsEnv(true)),
-		)
+	// Test 4: Multiple secrets with custom IDs
+	switch imgName {
+	case "nanoserver:latest":
+		st = llb.Image(imgName).
+			Run(llb.Shlex(`cmd /C "if "%MYPASSWORD%-%MYTOKEN%"=="pw-token" (exit 0) else (exit 1)"`),
+				llb.AddSecret("MYPASSWORD", llb.SecretID("pass"), llb.SecretAsEnv(true)),
+				llb.AddSecret("MYTOKEN", llb.SecretAsEnv(true)),
+			)
+	case "busybox:latest":
+		st = llb.Image(imgName).
+			Run(llb.Shlex(`sh -c '[ "$(echo ${MYPASSWORD}-${MYTOKEN})" = "pw-token" ]' `),
+				llb.AddSecret("MYPASSWORD", llb.SecretID("pass"), llb.SecretAsEnv(true)),
+				llb.AddSecret("MYTOKEN", llb.SecretAsEnv(true)),
+			)
+	}
 
 	def, err = st.Marshal(sb.Context())
 	require.NoError(t, err)
@@ -1957,60 +2132,6 @@ func testRelativeWorkDir(t *testing.T, sb integration.Sandbox) {
 		"C:\\test1\\test2\r\n",
 	)
 	require.Equal(t, []byte(pathStr), dt)
-}
-
-// TODO: remove this test once `client.SolveOpt.LocalDirs`, now marked as deprecated, is removed.
-// For more context on this test, please check:
-// https://github.com/moby/buildkit/pull/4583#pullrequestreview-1847043452
-func testSolverOptLocalDirsStillWorks(t *testing.T, sb integration.Sandbox) {
-	c, err := New(sb.Context(), sb.Address())
-	require.NoError(t, err)
-	defer c.Close()
-
-	imgName := integration.UnixOrWindows(
-		"docker.io/library/busybox:latest",
-		"mcr.microsoft.com/windows/nanoserver:ltsc2022",
-	)
-	cmdStr := integration.UnixOrWindows(
-		`sh -c "/bin/rev < input.txt > /out/output.txt"`,
-		`cmd /C "type input.txt > /out/output.txt"`,
-	)
-	out := llb.Image(imgName).
-		File(llb.Copy(llb.Local("mylocal"), "input.txt", "input.txt")).
-		Run(llb.Shlex(cmdStr)).
-		AddMount(`/out`, llb.Scratch())
-
-	def, err := out.Marshal(sb.Context())
-	require.NoError(t, err)
-
-	srcDir := integration.Tmpdir(t,
-		fstest.CreateFile("input.txt", []byte("Hello World"), 0600),
-	)
-
-	destDir := integration.Tmpdir(t)
-
-	_, err = c.Solve(sb.Context(), def, SolveOpt{
-		LocalDirs: map[string]string{
-			"mylocal": srcDir.Name,
-		},
-		Exports: []ExportEntry{
-			{
-				Type:      ExporterLocal,
-				OutputDir: destDir.Name,
-			},
-		},
-	}, nil)
-
-	require.NoError(t, err)
-
-	dt, err := os.ReadFile(filepath.Join(destDir.Name, "output.txt"))
-	require.NoError(t, err)
-	// not reversed on Windows since there's no handy rev utility
-	revStr := integration.UnixOrWindows(
-		"dlroW olleH",
-		"Hello World",
-	)
-	require.Equal(t, []byte(revStr), dt)
 }
 
 func testFileOpMkdirMkfile(t *testing.T, sb integration.Sandbox) {
@@ -2171,7 +2292,7 @@ func testFileOpCopyUIDCache(t *testing.T, sb integration.Sandbox) {
 		Exports: []ExportEntry{
 			{
 				Type:   ExporterTar,
-				Output: fixedWriteCloser(&nopWriteCloser{&buf}),
+				Output: fixedWriteCloser(&iohelper.NopWriteCloser{Writer: &buf}),
 			},
 		},
 	}, nil)
@@ -2197,7 +2318,7 @@ func testFileOpCopyUIDCache(t *testing.T, sb integration.Sandbox) {
 		Exports: []ExportEntry{
 			{
 				Type:   ExporterTar,
-				Output: fixedWriteCloser(&nopWriteCloser{&buf}),
+				Output: fixedWriteCloser(&iohelper.NopWriteCloser{Writer: &buf}),
 			},
 		},
 	}, nil)
@@ -2362,9 +2483,9 @@ func testFileOpCopyAlwaysReplaceExistingDestPaths(t *testing.T, sb integration.S
 				OutputDir: resultDirHostPath,
 			},
 		},
-		LocalDirs: map[string]string{
-			"destDir": destDirHostPath.Name,
-			"srcDir":  srcDirHostPath.Name,
+		LocalMounts: map[string]fsutil.FS{
+			"destDir": destDirHostPath,
+			"srcDir":  srcDirHostPath,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -2583,7 +2704,7 @@ func testOCILayoutSource(t *testing.T, sb integration.Sandbox) {
 			{
 				Type:   ExporterOCI,
 				Attrs:  attrs,
-				Output: fixedWriteCloser(nopWriteCloser{outW}),
+				Output: fixedWriteCloser(&iohelper.NopWriteCloser{Writer: outW}),
 			},
 		},
 	}, nil)
@@ -2706,7 +2827,7 @@ func testSessionExporter(t *testing.T, sb integration.Sandbox) {
 		require.Equal(t, "foo", resp.Entries[1].Path)
 
 		exporterCalled = true
-		target.Add(filesync.WithFSSync(0, fixedWriteCloser(nopWriteCloser{outW})))
+		target.Add(filesync.WithFSSync(0, fixedWriteCloser(&iohelper.NopWriteCloser{Writer: outW})))
 		return []*exporter.ExporterRequest{
 			{
 				Type: ExporterOCI,
@@ -2821,7 +2942,7 @@ func testOCILayoutPlatformSource(t *testing.T, sb integration.Sandbox) {
 			{
 				Type:   ExporterOCI,
 				Attrs:  attrs,
-				Output: fixedWriteCloser(nopWriteCloser{outW}),
+				Output: fixedWriteCloser(&iohelper.NopWriteCloser{Writer: outW}),
 			},
 		},
 	}, "", frontend, nil)
@@ -3606,6 +3727,93 @@ func testBuildHTTPSourceHeader(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, http.MethodGet, allReqs[0].Method)
 	require.Equal(t, "application/vnd.foo", allReqs[0].Header.Get("accept"))
 	require.Equal(t, "fooagent", allReqs[0].Header.Get("user-agent"))
+}
+
+func testBuildHTTPSourcePGPSignatureVerify(t *testing.T, sb integration.Sandbox) {
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	signFixturesPath, ok := os.LookupEnv("BUILDKIT_TEST_SIGN_FIXTURES")
+	if !ok {
+		t.Skip("missing BUILDKIT_TEST_SIGN_FIXTURES")
+	}
+
+	payload, err := os.ReadFile(filepath.Join(signFixturesPath, "user1.http.artifact"))
+	require.NoError(t, err)
+	sigData, err := os.ReadFile(filepath.Join(signFixturesPath, "user1.http.artifact.asc"))
+	require.NoError(t, err)
+	pubKeyData, err := os.ReadFile(filepath.Join(signFixturesPath, "user1.gpg.pub"))
+	require.NoError(t, err)
+	wrongPubKeyData, err := os.ReadFile(filepath.Join(signFixturesPath, "user2.gpg.pub"))
+	require.NoError(t, err)
+
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/artifact.txt" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(payload)
+	}))
+	defer httpSrv.Close()
+
+	solve := func(t *testing.T, state llb.State) error {
+		def, err := state.Marshal(sb.Context())
+		require.NoError(t, err)
+		tmpdir := t.TempDir()
+		_, err = c.Solve(sb.Context(), def, SolveOpt{
+			Exports: []ExportEntry{
+				{
+					Type:      ExporterLocal,
+					OutputDir: tmpdir,
+				},
+			},
+		}, nil)
+		if err != nil {
+			return err
+		}
+		dt, err := os.ReadFile(filepath.Join(tmpdir, "artifact.txt"))
+		require.NoError(t, err)
+		require.Equal(t, payload, dt)
+		return nil
+	}
+
+	t.Run("valid-signature", func(t *testing.T) {
+		validState := llb.HTTP(
+			httpSrv.URL+"/artifact.txt",
+			llb.VerifyPGPSignature(llb.HTTPSignatureInfo{
+				PubKey:    pubKeyData,
+				Signature: sigData,
+			}),
+		)
+		require.NoError(t, solve(t, validState))
+	})
+
+	t.Run("wrong-pubkey", func(t *testing.T) {
+		invalidState := llb.HTTP(
+			httpSrv.URL+"/artifact.txt",
+			llb.VerifyPGPSignature(llb.HTTPSignatureInfo{
+				PubKey:    wrongPubKeyData,
+				Signature: sigData,
+			}),
+		)
+		err = solve(t, invalidState)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "failed to verify pgp signature")
+	})
+
+	t.Run("concatenated-pubkeys-right-key-second", func(t *testing.T) {
+		mergedPubKeys := append(append([]byte{}, wrongPubKeyData...), '\n')
+		mergedPubKeys = append(mergedPubKeys, pubKeyData...)
+		state := llb.HTTP(
+			httpSrv.URL+"/artifact.txt",
+			llb.VerifyPGPSignature(llb.HTTPSignatureInfo{
+				PubKey:    mergedPubKeys,
+				Signature: sigData,
+			}),
+		)
+		require.NoError(t, solve(t, state))
+	})
 }
 
 func testResolveAndHosts(t *testing.T, sb integration.Sandbox) {
@@ -4616,7 +4824,7 @@ func testFrontendMetadataReturn(t *testing.T, sb integration.Sandbox) {
 		exports = []ExportEntry{{
 			Type:   ExporterOCI,
 			Attrs:  map[string]string{},
-			Output: fixedWriteCloser(nopWriteCloser{io.Discard}),
+			Output: fixedWriteCloser(&iohelper.NopWriteCloser{Writer: io.Discard}),
 		}}
 	}
 
@@ -4743,7 +4951,7 @@ func testTarExporterWithSocket(t *testing.T, sb integration.Sandbox) {
 				Type:  ExporterTar,
 				Attrs: map[string]string{},
 				Output: func(m map[string]string) (io.WriteCloser, error) {
-					return nopWriteCloser{io.Discard}, nil
+					return &iohelper.NopWriteCloser{Writer: io.Discard}, nil
 				},
 			},
 		},
@@ -4799,7 +5007,7 @@ func testTarExporterSymlink(t *testing.T, sb integration.Sandbox) {
 		Exports: []ExportEntry{
 			{
 				Type:   ExporterTar,
-				Output: fixedWriteCloser(&nopWriteCloser{&buf}),
+				Output: fixedWriteCloser(&iohelper.NopWriteCloser{Writer: &buf}),
 			},
 		},
 	}, nil)
@@ -5121,8 +5329,19 @@ func testBuildExportWithUncompressed(t *testing.T, sb integration.Sandbox) {
 	require.Equal(t, []byte("gzip"), item.Data)
 }
 
+/*
+testBuildExportZstd verifies OCI export with Zstd-compressed layers.
+It builds a simple layer, exports it with Zstd compression, and validates both
+OCI and Docker schema 2 media types.
+*/
 func testBuildExportZstd(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
+	/*
+		Skipped on Windows:
+		1. AddMount() fails because Windows snapshots allow only a single mount per layer.
+		2. OCI export fails because windowsLcowDiff lacks the Compare method needed to
+		   generate compressed layer diffs.
+	*/
+	integration.SkipOnPlatform(t, "windows", "Windows container support incomplete: AddMount() fails with 'number of mounts should always be 1 for Windows layers', OCI export fails with 'windowsLcowDiff does not implement Compare method'")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureOCIExporter)
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -7335,7 +7554,7 @@ func testExportLocalForcePlatformSplit(t *testing.T, sb integration.Sandbox) {
 
 	require.Len(t, fis, 1, "expected one files in the output directory")
 
-	expPlatform := strings.ReplaceAll(platforms.FormatAll(platforms.DefaultSpec()), "/", "_")
+	expPlatform := strings.ReplaceAll(platforms.FormatAll(platforms.Normalize(platforms.DefaultSpec())), "/", "_")
 	_, err = os.Stat(filepath.Join(destDir, expPlatform+"/"))
 	require.NoError(t, err)
 
@@ -7558,13 +7777,24 @@ func testRunCacheWithMounts(t *testing.T, sb integration.Sandbox) {
 	imgName := integration.UnixOrWindows("busybox:latest", "nanoserver:latest")
 	busybox := llb.Image(imgName)
 
+	imgAlpine := integration.UnixOrWindows("alpine:latest", "nanoserver:plus")
+	alpineImage := llb.Image(imgAlpine)
+
+	// On Windows ARM64, nanoserver:plus and nanoserver:latest map to the same
+	// image, so we create a marker file to distinguish the mounted image.
+	mountSource := alpineImage
+	if runtime.GOOS == "windows" {
+		mountSource = alpineImage.Run(
+			llb.Shlex(`cmd /C echo 1> C:/marker`),
+		).Root()
+	}
+
 	cmdStr := integration.UnixOrWindows(
 		`sh -e -c "[[ -f /m1/sbin/apk ]]"`,
-		`cmd /C if exist C:\\m1\\Windows\\System32\\whoami.exe (exit 0) else (exit 1)`,
+		`cmd /C if exist C:/m1/marker (exit 0) else (exit 1)`,
 	)
 	out := busybox.Run(llb.Shlex(cmdStr))
-	imgAlpine := integration.UnixOrWindows("alpine:latest", "nanoserver:plus")
-	out.AddMount("/m1", llb.Image(imgAlpine), llb.Readonly)
+	out.AddMount("/m1", mountSource, llb.Readonly)
 
 	def, err := out.Marshal(sb.Context())
 	require.NoError(t, err)
@@ -7574,7 +7804,7 @@ func testRunCacheWithMounts(t *testing.T, sb integration.Sandbox) {
 
 	cmdStr = integration.UnixOrWindows(
 		`sh -e -c "[[ ! -f /m1/sbin/apk ]]"`,
-		`cmd /C if exist C:\\m1\\Windows\\System32\\whoami.exe (exit 1)`,
+		`cmd /C if exist C:/m1/marker (exit 1) else (exit 0)`,
 	)
 	out = busybox.Run(llb.Shlex(cmdStr))
 	out.AddMount("/m1", llb.Image(imgName), llb.Readonly)
@@ -7815,21 +8045,30 @@ func testWhiteoutParentDir(t *testing.T, sb integration.Sandbox) {
 
 // #2490
 func testMoveParentDir(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureOCIExporter)
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
-	busybox := llb.Image("busybox:latest")
+	imgName := integration.UnixOrWindows("busybox:latest", "nanoserver:latest")
+	busybox := llb.Image(imgName)
 	st := llb.Scratch()
 
-	run := func(cmd string) {
-		st = busybox.Run(llb.Shlex(cmd), llb.Dir("/wd")).AddMount("/wd", st)
-	}
+	switch imgName {
+	case "nanoserver:latest":
+		run := func(cmd string) {
+			st = busybox.Run(llb.Shlex(cmd), llb.Dir("/wd")).Root()
+		}
 
-	run(`sh -c "mkdir -p foo; echo -n first > foo/bar;"`)
-	run(`mv foo foo2`)
+		run(`cmd /c "mkdir foo && echo first > foo/bar && move foo foo2"`)
+	case "busybox:latest":
+		run := func(cmd string) {
+			st = busybox.Run(llb.Shlex(cmd), llb.Dir("/wd")).AddMount("/wd", st)
+		}
+
+		run(`sh -c "mkdir -p foo; echo -n first > foo/bar;"`)
+		run(`mv foo foo2`)
+	}
 
 	def, err := st.Marshal(sb.Context())
 	require.NoError(t, err)
@@ -7871,14 +8110,62 @@ func testMoveParentDir(t *testing.T, sb integration.Sandbox) {
 	m, err = testutil.ReadTarToMap(layer.Data, true)
 	require.NoError(t, err)
 
-	_, ok = m[".wh.foo"]
-	require.True(t, ok)
+	switch imgName {
+	case "nanoserver:latest":
+		_, ok = m["/wd/foo/bar"] // Should be false, else move didn't happen
+		require.False(t, ok)
 
-	_, ok = m["foo2/"]
-	require.True(t, ok)
+		_, ok = m["Files/wd/foo/bar"] // Should be false, else move didn't happen
+		require.False(t, ok)
 
-	_, ok = m["foo2/bar"]
-	require.True(t, ok)
+		_, ok = m["Files/wd/foo2/bar"]
+		require.True(t, ok)
+
+		_, ok = m["Files/wd/foo2"]
+		require.True(t, ok)
+
+		_, ok = m["Files/wd"]
+		require.True(t, ok)
+
+		for key := range m {
+			if err == nil && strings.Contains(key, "/wd") {
+				ok = true
+				break
+			} else {
+				ok = false
+			}
+		}
+		require.True(t, ok)
+
+		for key := range m {
+			if err == nil && strings.Contains(key, "/foo2/bar") {
+				ok = true
+				break
+			} else {
+				ok = false
+			}
+		}
+		require.True(t, ok)
+
+		for key := range m {
+			if err == nil && strings.Contains(key, "/foo2") {
+				ok = true
+				break
+			} else {
+				ok = false
+			}
+		}
+		require.True(t, ok)
+	case "busybox:latest":
+		_, ok = m[".wh.foo"]
+		require.True(t, ok)
+
+		_, ok = m["foo2/"]
+		require.True(t, ok)
+
+		_, ok = m["foo2/bar"]
+		require.True(t, ok)
+	}
 }
 
 // #319
@@ -11361,6 +11648,212 @@ func testMountStubsTimestamp(t *testing.T, sb integration.Sandbox) {
 	}
 }
 
+func testImageBlobSource(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush)
+	requiresLinux(t)
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	st := llb.Image("alpine")
+
+	def, err := st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	name := registry + "/foo/blobtest:img"
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: "image",
+				Attrs: map[string]string{
+					"name": name,
+					"push": "true",
+				},
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	desc, provider, err := contentutil.ProviderFromRef(name)
+	require.NoError(t, err)
+
+	imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, len(imgs.Images))
+	mfst := imgs.Images[0].Manifest
+	require.GreaterOrEqual(t, len(mfst.Layers), 1)
+
+	l := mfst.Layers[0]
+
+	blob := llb.ImageBlob(registry+"/foo/blobtest@"+l.Digest.String(), llb.Filename("layer.tar.gz"), llb.Chown(123, 456))
+	st = llb.Image("alpine").Run(llb.Shlex(`sh -c 'sha256sum /layers/layer.tar.gz | cut -d" " -f0 > /out/checksum && stat -c "%u-%g-%s" /layers/layer.tar.gz > /out/stat'`), llb.AddMount("/layers", blob, llb.Readonly)).AddMount("/out", llb.Scratch())
+
+	def, err = st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		FrontendAttrs: map[string]string{
+			"attest:provenance": "",
+		},
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := os.ReadFile(filepath.Join(destDir, "stat"))
+	require.NoError(t, err)
+
+	require.Equal(t, "123-456-"+strconv.FormatInt(l.Size, 10), strings.TrimSpace(string(dt)))
+
+	dt, err = os.ReadFile(filepath.Join(destDir, "checksum"))
+	require.NoError(t, err)
+
+	require.Equal(t, l.Digest.Hex(), strings.TrimSpace(string(dt)))
+
+	provDt, err := os.ReadFile(filepath.Join(destDir, "provenance.json"))
+	require.NoError(t, err)
+
+	var stmt struct {
+		intoto.StatementHeader
+		Predicate provenancetypes.ProvenancePredicateSLSA1 `json:"predicate"`
+	}
+	require.NoError(t, json.Unmarshal(provDt, &stmt))
+
+	expectedName, err := purl.RefToPURL(packageurl.TypeDocker, registry+"/foo/blobtest@"+l.Digest.String(), nil)
+	require.NoError(t, err)
+	purlObj, err := packageurl.FromString(expectedName)
+	require.NoError(t, err)
+	purlObj.Qualifiers = append(purlObj.Qualifiers, packageurl.Qualifier{Key: "ref_type", Value: "blob"})
+	expectedName = purlObj.ToString()
+
+	found := false
+	for _, m := range stmt.Predicate.BuildDefinition.ResolvedDependencies {
+		if m.URI == expectedName {
+			found = true
+			require.Equal(t, l.Digest.Hex(), m.Digest["sha256"])
+			break
+		}
+	}
+	require.True(t, found, "expected to find %q in %+v", expectedName, stmt.Predicate.BuildDefinition.ResolvedDependencies)
+}
+
+func testOCILayoutBlobSource(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureOCIExporter, workers.FeatureOCILayout)
+	requiresLinux(t)
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	st := llb.Image("alpine")
+	def, err := st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	ociDir := t.TempDir()
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		Exports: []ExportEntry{
+			{
+				Type: ExporterOCI,
+				Attrs: map[string]string{
+					"tar": "false",
+				},
+				OutputDir: ociDir,
+			},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	indexDt, err := os.ReadFile(filepath.Join(ociDir, ocispecs.ImageIndexFile))
+	require.NoError(t, err)
+
+	var index ocispecs.Index
+	err = json.Unmarshal(indexDt, &index)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(index.Manifests))
+
+	var mfst ocispecs.Manifest
+	mfstDt, err := os.ReadFile(filepath.Join(ociDir, "blobs/sha256", index.Manifests[0].Digest.Hex()))
+	require.NoError(t, err)
+	err = json.Unmarshal(mfstDt, &mfst)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(mfst.Layers), 1)
+	layer := mfst.Layers[0]
+
+	store, err := local.NewStore(ociDir)
+	require.NoError(t, err)
+	csID := "my-blob-content-store"
+
+	blob := llb.OCILayoutBlob("not/real@"+layer.Digest.String(), llb.ImageBlobOCIStore("", csID), llb.Filename("layer.tar.gz"), llb.Chown(123, 456))
+	st = llb.Image("alpine").Run(llb.Shlex(`sh -c 'sha256sum /layers/layer.tar.gz | cut -d" " -f0 > /out/checksum && stat -c "%u-%g-%s" /layers/layer.tar.gz > /out/stat'`), llb.AddMount("/layers", blob, llb.Readonly)).AddMount("/out", llb.Scratch())
+
+	def, err = st.Marshal(sb.Context())
+	require.NoError(t, err)
+
+	destDir := t.TempDir()
+	_, err = c.Solve(sb.Context(), def, SolveOpt{
+		FrontendAttrs: map[string]string{
+			"attest:provenance": "",
+		},
+		Exports: []ExportEntry{
+			{
+				Type:      ExporterLocal,
+				OutputDir: destDir,
+			},
+		},
+		OCIStores: map[string]content.Store{
+			csID: store,
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	dt, err := os.ReadFile(filepath.Join(destDir, "stat"))
+	require.NoError(t, err)
+	require.Equal(t, "123-456-"+strconv.FormatInt(layer.Size, 10), strings.TrimSpace(string(dt)))
+
+	dt, err = os.ReadFile(filepath.Join(destDir, "checksum"))
+	require.NoError(t, err)
+	require.Equal(t, layer.Digest.Hex(), strings.TrimSpace(string(dt)))
+
+	provDt, err := os.ReadFile(filepath.Join(destDir, "provenance.json"))
+	require.NoError(t, err)
+
+	var stmt struct {
+		intoto.StatementHeader
+		Predicate provenancetypes.ProvenancePredicateSLSA1 `json:"predicate"`
+	}
+	require.NoError(t, json.Unmarshal(provDt, &stmt))
+
+	expectedName, err := purl.RefToPURL(packageurl.TypeOCI, "not/real@"+layer.Digest.String(), nil)
+	require.NoError(t, err)
+	purlObj, err := packageurl.FromString(expectedName)
+	require.NoError(t, err)
+	purlObj.Qualifiers = append(purlObj.Qualifiers, packageurl.Qualifier{Key: "ref_type", Value: "blob"})
+	expectedName = purlObj.ToString()
+
+	found := false
+	for _, m := range stmt.Predicate.BuildDefinition.ResolvedDependencies {
+		if m.URI == expectedName {
+			found = true
+			require.Equal(t, layer.Digest.Hex(), m.Digest["sha256"])
+			break
+		}
+	}
+	require.True(t, found, "expected to find %q in %+v", expectedName, stmt.Predicate.BuildDefinition.ResolvedDependencies)
+}
+
 func testFrontendVerifyPlatforms(t *testing.T, sb integration.Sandbox) {
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -11585,7 +12078,8 @@ func makeSSHAgentSock(t *testing.T, agent agent.Agent) (p string, err error) {
 	tmpDir := integration.Tmpdir(t)
 	sockPath := filepath.Join(tmpDir.Name, "ssh_auth_sock")
 
-	l, err := net.Listen("unix", sockPath)
+	listener := net.ListenConfig{}
+	l, err := listener.Listen(context.TODO(), "unix", sockPath)
 	if err != nil {
 		return "", err
 	}
@@ -11911,8 +12405,6 @@ func testSourcePolicy(t *testing.T, sb integration.Sandbox) {
 }
 
 func testLLBMountPerformance(t *testing.T, sb integration.Sandbox) {
-	// flaky on WS2025 and moby/moby too
-	integration.SkipOnPlatform(t, "windows")
 	c, err := New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
@@ -11923,7 +12415,9 @@ func testLLBMountPerformance(t *testing.T, sb integration.Sandbox) {
 	mntInput := llb.Image(imgName)
 	st := llb.Image(imgName)
 	var mnts []llb.State
-	for range 20 {
+	// Reduce iterations on Windows due to significantly slower container operations
+	numIterations := integration.UnixOrWindows(20, 5)
+	for range numIterations {
 		execSt := st.Run(
 			llb.Args(integration.UnixOrWindows(
 				[]string{"true"},
@@ -11940,8 +12434,9 @@ func testLLBMountPerformance(t *testing.T, sb integration.Sandbox) {
 	def, err := st.Marshal(sb.Context())
 	require.NoError(t, err)
 
-	// Windows images take longer time
-	timeout := integration.UnixOrWindows(time.Minute, 3*time.Minute)
+	// Windows images take longer time, especially on CI systems
+	// With reduced iterations (5 vs 20), use generous timeout
+	timeout := integration.UnixOrWindows(time.Minute, 10*time.Minute)
 	timeoutCtx, cancel := context.WithTimeoutCause(sb.Context(), timeout, nil)
 	defer cancel()
 	_, err = c.Solve(timeoutCtx, def, SolveOpt{}, nil)
@@ -12080,19 +12575,19 @@ func testGitResolveSourceMetadata(t *testing.T, sb integration.Sandbox) {
 	err = runInDir(gitDir, gitCommands...)
 	require.NoError(t, err)
 
-	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "HEAD")
 	cmd.Dir = gitDir
 	out, err := cmd.Output()
 	require.NoError(t, err)
 	commitHEAD := strings.TrimSpace(string(out))
 
-	cmd = exec.Command("git", "rev-parse", "v0.1")
+	cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "v0.1")
 	cmd.Dir = gitDir
 	out, err = cmd.Output()
 	require.NoError(t, err)
 	commitTag := strings.TrimSpace(string(out))
 
-	cmd = exec.Command("git", "rev-parse", "v0.1^{commit}")
+	cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "v0.1^{commit}")
 	cmd.Dir = gitDir
 	out, err = cmd.Output()
 	require.NoError(t, err)
@@ -12340,6 +12835,216 @@ func testImageResolveAttestationChainRequiresNetwork(t *testing.T, sb integratio
 		return nil, nil
 	}, nil)
 	require.NoError(t, err)
+}
+
+func testImageResolveProvenanceAttestation(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush, workers.FeatureProvenance)
+	requiresLinux(t)
+
+	ctx := sb.Context()
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	target, platform := buildProvenanceImage(ctx, t, c, sb)
+
+	_, err = c.Build(ctx, SolveOpt{}, "test", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		md, err := c.ResolveSourceMetadata(ctx, &pb.SourceOp{
+			Identifier: "docker-image://" + target,
+		}, sourceresolver.Opt{
+			ImageOpt: &sourceresolver.ResolveImageOpt{
+				NoConfig: true,
+				ResolveAttestations: []string{
+					policyimage.SLSAProvenancePredicateType02,
+					policyimage.SLSAProvenancePredicateType1,
+				},
+				Platform:    &platform,
+				ResolveMode: pb.AttrImageResolveModeForcePull,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		require.NotNil(t, md.Image)
+		require.NotNil(t, md.Image.AttestationChain)
+		ac := md.Image.AttestationChain
+		require.NotEmpty(t, ac.AttestationManifest)
+		att := ac.Blobs[ac.AttestationManifest]
+		require.NotEmpty(t, att.Data)
+
+		var manifest ocispecs.Manifest
+		require.NoError(t, json.Unmarshal(att.Data, &manifest))
+		require.NotEmpty(t, manifest.Layers)
+		var (
+			stmtBytes  []byte
+			foundLayer ocispecs.Descriptor
+		)
+		for _, layer := range manifest.Layers {
+			if !isSLSAPredicateType(layer.Annotations["in-toto.io/predicate-type"]) {
+				continue
+			}
+			blob, ok := ac.Blobs[layer.Digest]
+			if !ok {
+				continue
+			}
+			stmtBytes = blob.Data
+			foundLayer = layer
+			break
+		}
+		require.NotEmpty(t, stmtBytes)
+		require.Contains(t, []string{
+			policyimage.SLSAProvenancePredicateType02,
+			policyimage.SLSAProvenancePredicateType1,
+		}, foundLayer.Annotations["in-toto.io/predicate-type"])
+
+		var stmt intoto.Statement
+		require.NoError(t, json.Unmarshal(stmtBytes, &stmt))
+		require.Equal(t, "https://in-toto.io/Statement/v0.1", stmt.Type)
+		require.Contains(t, []string{
+			policyimage.SLSAProvenancePredicateType02,
+			policyimage.SLSAProvenancePredicateType1,
+		}, stmt.PredicateType)
+		require.Equal(t, stmt.Subject[0].Digest["sha256"], ac.ImageManifest.Hex())
+		return nil, nil
+	}, nil)
+	require.NoError(t, err)
+}
+
+func testImageResolveAttestationChainLocal(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureDirectPush, workers.FeatureProvenance)
+	requiresLinux(t)
+
+	ctx := sb.Context()
+	c, err := New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	target, platform := buildProvenanceImage(ctx, t, c, sb)
+
+	_, err = c.Build(ctx, SolveOpt{}, "test", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		md, err := c.ResolveSourceMetadata(ctx, &pb.SourceOp{
+			Identifier: "docker-image://" + target,
+		}, sourceresolver.Opt{
+			ImageOpt: &sourceresolver.ResolveImageOpt{
+				NoConfig:         true,
+				AttestationChain: true,
+				Platform:         &platform,
+				ResolveMode:      pb.AttrImageResolveModeForcePull,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		require.NotNil(t, md.Image)
+		require.NotNil(t, md.Image.AttestationChain)
+		ac := md.Image.AttestationChain
+		require.NotEmpty(t, ac.AttestationManifest)
+		att := ac.Blobs[ac.AttestationManifest]
+		require.NotEmpty(t, att.Data)
+
+		var manifest ocispecs.Manifest
+		require.NoError(t, json.Unmarshal(att.Data, &manifest))
+		require.NotEmpty(t, manifest.Layers)
+		found := false
+		for _, layer := range manifest.Layers {
+			if isSLSAPredicateType(layer.Annotations["in-toto.io/predicate-type"]) {
+				found = true
+				break
+			}
+		}
+		require.True(t, found)
+		return nil, nil
+	}, nil)
+	require.NoError(t, err)
+}
+
+func buildProvenanceImage(ctx context.Context, t *testing.T, c *Client, sb integration.Sandbox) (string, ocispecs.Platform) {
+	t.Helper()
+
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	platform := platforms.Normalize(platforms.DefaultSpec())
+	platformKey := platforms.Format(platform)
+	target := registry + "/buildkit/testprovenance:latest"
+
+	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		res := gateway.NewResult()
+
+		st := llb.Scratch().File(
+			llb.Mkfile("/greeting", 0600, []byte("hello provenance")),
+		)
+		def, err := st.Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		r, err := c.Solve(ctx, gateway.SolveRequest{
+			Definition: def.ToPB(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		ref, err := r.SingleRef()
+		if err != nil {
+			return nil, err
+		}
+		_, err = ref.ToState()
+		if err != nil {
+			return nil, err
+		}
+		res.AddRef(platformKey, ref)
+
+		img := ocispecs.Image{
+			Platform: platform,
+		}
+		config, err := json.Marshal(img)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to marshal image config")
+		}
+		res.AddMeta(fmt.Sprintf("%s/%s", exptypes.ExporterImageConfigKey, platformKey), config)
+
+		expPlatforms := &exptypes.Platforms{
+			Platforms: []exptypes.Platform{{ID: platformKey, Platform: platform}},
+		}
+		dt, err := json.Marshal(expPlatforms)
+		if err != nil {
+			return nil, err
+		}
+		res.AddMeta(exptypes.ExporterPlatformsKey, dt)
+
+		return res, nil
+	}
+
+	_, err = c.Build(ctx, SolveOpt{
+		FrontendAttrs: map[string]string{
+			"attest:provenance": "mode=max,version=v1",
+		},
+		Exports: []ExportEntry{
+			{
+				Type: ExporterImage,
+				Attrs: map[string]string{
+					"name": target,
+					"push": "true",
+				},
+			},
+		},
+	}, "", frontend, nil)
+	require.NoError(t, err)
+
+	return target, platform
+}
+
+// isSLSAPredicateType reports whether the predicate type represents SLSA provenance.
+func isSLSAPredicateType(v string) bool {
+	switch v {
+	case policyimage.SLSAProvenancePredicateType02, policyimage.SLSAProvenancePredicateType1:
+		return true
+	default:
+		return false
+	}
 }
 
 func testHTTPPruneAfterCacheKey(t *testing.T, sb integration.Sandbox) {
@@ -12659,13 +13364,13 @@ func testGitResolveMutatedSource(t *testing.T, sb integration.Sandbox) {
 	err = runInDir(gitDir, gitCommands...)
 	require.NoError(t, err)
 
-	cmd := exec.Command("git", "rev-parse", "v0.1")
+	cmd := exec.CommandContext(context.TODO(), "git", "rev-parse", "v0.1")
 	cmd.Dir = gitDir
 	out, err := cmd.Output()
 	require.NoError(t, err)
 	commitTag := strings.TrimSpace(string(out))
 
-	cmd = exec.Command("git", "rev-parse", "v0.1^{commit}")
+	cmd = exec.CommandContext(context.TODO(), "git", "rev-parse", "v0.1^{commit}")
 	cmd.Dir = gitDir
 	out, err = cmd.Output()
 	require.NoError(t, err)
@@ -12754,9 +13459,9 @@ func runInDirEnv(dir string, env []string, cmds ...string) error {
 	for _, args := range cmds {
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
-			cmd = exec.Command("powershell", "-command", args)
+			cmd = exec.CommandContext(context.TODO(), "powershell", "-command", args)
 		} else {
-			cmd = exec.Command("sh", "-c", args)
+			cmd = exec.CommandContext(context.TODO(), "sh", "-c", args)
 		}
 		cmd.Env = append(os.Environ(), env...)
 		cmd.Dir = dir
@@ -12779,6 +13484,81 @@ func (w warningsListOutput) String() string {
 		_, _ = b.Write(warn.Short)
 	}
 	return b.String()
+}
+
+func testListenBuildHistoryExcludesSoftDeletedRecords(t *testing.T, sb integration.Sandbox) {
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	// Create 3 completed builds so we have multiple history records.
+	var buildRefs [3]string
+	for i := range buildRefs {
+		def, err := llb.Scratch().File(llb.Mkfile(fmt.Sprintf("file%d", i), 0o644, nil)).Marshal(sb.Context())
+		require.NoError(t, err)
+
+		buildRefs[i] = identity.NewID()
+		_, err = c.Solve(sb.Context(), def, SolveOpt{Ref: buildRefs[i]}, nil)
+		require.NoError(t, err)
+	}
+
+	refToDelete := buildRefs[1]
+
+	// Start a streaming listener on one specific ref. This increments the
+	// internal reference count, which causes Delete to soft-delete instead
+	// of removing the record from the database.
+	listenerCtx, listenerCancel := context.WithCancelCause(sb.Context())
+	defer listenerCancel(nil)
+
+	cl, err := c.ControlClient().ListenBuildHistory(listenerCtx, &controlapi.BuildHistoryRequest{
+		Ref: refToDelete,
+	})
+	require.NoError(t, err)
+
+	// Read the initial record so the listener is fully registered.
+	_, err = cl.Recv()
+	require.NoError(t, err)
+
+	// Soft-delete: the record is marked deleted but stays in the DB because
+	// the listener above still holds a reference.
+	_, err = c.ControlClient().UpdateBuildHistory(sb.Context(), &controlapi.UpdateBuildHistoryRequest{
+		Ref:    refToDelete,
+		Delete: true,
+	})
+	require.NoError(t, err)
+
+	// List all remaining history records with a limit to trigger sorting.
+	// Before the fix this panicked with a nil pointer dereference because
+	// the soft-deleted record left a nil entry in the event slice.
+	cl2, err := c.ControlClient().ListenBuildHistory(sb.Context(), &controlapi.BuildHistoryRequest{
+		EarlyExit: true,
+		Limit:     10,
+	})
+	require.NoError(t, err)
+
+	gotRefs := map[string]bool{}
+	for {
+		resp, err := cl2.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		gotRefs[resp.Record.Ref] = true
+	}
+
+	// The soft-deleted record must not appear in the results.
+	assert.False(t, gotRefs[refToDelete], "soft-deleted ref %s should not appear in history list", refToDelete)
+	assert.True(t, gotRefs[buildRefs[0]], "ref %s should appear in history list", buildRefs[0])
+	assert.True(t, gotRefs[buildRefs[2]], "ref %s should appear in history list", buildRefs[2])
+
+	// Clean up the streaming listener.
+	listenerCancel(nil)
+	// Drain the stream so gRPC can clean up.
+	for {
+		if _, err := cl.Recv(); err != nil {
+			break
+		}
+	}
 }
 
 func parseFSMetadata(t *testing.T, dt []byte) []fsutiltypes.Stat {
