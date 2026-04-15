@@ -1145,67 +1145,62 @@ func (cm *cacheManager) pruneOnce(ctx context.Context, ch chan client.UsageInfo,
 			continue
 		}
 
-		if len(cr.refs) > 0 {
-			_, lu := cr.getLastUsed()
-			bklog.G(ctx).Infof("%.2fMB prune skip refs=%d id=%s lastUsed=%v",
-				float64(cr.getSize())/(1024*1024), len(cr.refs), cr.ID(), lu)
+		if len(cr.refs) > 0 && (!opt.all || opt.keepBytes == 0) {
+			cr.mu.Unlock()
+			continue
 		}
 
-		if len(cr.refs) == 0 {
-			recordType := cr.GetRecordType()
-			if recordType == "" {
-				recordType = client.UsageRecordTypeRegular
-			}
+		recordType := cr.GetRecordType()
+		if recordType == "" {
+			recordType = client.UsageRecordTypeRegular
+		}
 
-			shared := false
-			if opt.checkShared != nil {
-				shared = opt.checkShared.Exists(cr.ID(), cr.layerDigestChain())
-			}
+		shared := false
+		if opt.checkShared != nil {
+			shared = opt.checkShared.Exists(cr.ID(), cr.layerDigestChain())
+		}
 
-			if !opt.all {
-				if recordType == client.UsageRecordTypeInternal || recordType == client.UsageRecordTypeFrontend || shared {
-					cr.mu.Unlock()
-					continue
-				}
-			}
-
-			c := &client.UsageInfo{
-				ID:          cr.ID(),
-				Mutable:     cr.mutable,
-				RecordType:  recordType,
-				Shared:      shared,
-				Description: cr.GetDescription(),
-			}
-
-			usageCount, lastUsedAt := cr.getLastUsed()
-			c.LastUsedAt = lastUsedAt
-			c.UsageCount = usageCount
-
-			if opt.keepDuration != 0 {
-				if lastUsedAt != nil && lastUsedAt.After(cutOff) {
-					cr.mu.Unlock()
-					continue
-				}
-			}
-
-			if opt.filter.Match(adaptUsageInfo(c)) {
-				toDelete = append(toDelete, &deleteRecord{
-					cacheRecord: cr,
-					lastUsedAt:  c.LastUsedAt,
-					usageCount:  c.UsageCount,
-				})
-				locked[cr.mu] = struct{}{}
-				continue // leave the record locked
+		if !opt.all {
+			if recordType == client.UsageRecordTypeInternal || recordType == client.UsageRecordTypeFrontend || shared {
+				cr.mu.Unlock()
+				continue
 			}
 		}
+
+		c := &client.UsageInfo{
+			ID:          cr.ID(),
+			Mutable:     cr.mutable,
+			RecordType:  recordType,
+			Shared:      shared,
+			Description: cr.GetDescription(),
+		}
+
+		usageCount, lastUsedAt := cr.getLastUsed()
+		c.LastUsedAt = lastUsedAt
+		c.UsageCount = usageCount
+
+		if opt.keepDuration != 0 {
+			if lastUsedAt != nil && lastUsedAt.After(cutOff) {
+				cr.mu.Unlock()
+				continue
+			}
+		}
+
+		if opt.filter.Match(adaptUsageInfo(c)) {
+			toDelete = append(toDelete, &deleteRecord{
+				cacheRecord: cr,
+				lastUsedAt:  c.LastUsedAt,
+				usageCount:  c.UsageCount,
+			})
+			locked[cr.mu] = struct{}{}
+			continue // leave the record locked
+		}
+
 		cr.mu.Unlock()
 	}
 
 	if len(toDelete) > 0 {
 		sortDeleteRecords(toDelete)
-		bklog.G(ctx).Infof("prune candidates=%d, deleting=%s lastUsed=%v size=%.2fMB",
-			len(toDelete),
-			toDelete[0].ID(), toDelete[0].lastUsedAt, float64(toDelete[0].getSize())/(1024*1024))
 	}
 	batchSize := len(toDelete)
 	if gcMode && batchSize > 0 {
