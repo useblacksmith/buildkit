@@ -1145,6 +1145,12 @@ func (cm *cacheManager) pruneOnce(ctx context.Context, ch chan client.UsageInfo,
 			continue
 		}
 
+		if len(cr.refs) > 0 {
+			_, lu := cr.getLastUsed()
+			bklog.G(ctx).Infof("%.2fMB prune skip refs=%d id=%s lastUsed=%v",
+				float64(cr.getSize())/(1024*1024), len(cr.refs), cr.ID(), lu)
+		}
+
 		if len(cr.refs) == 0 {
 			recordType := cr.GetRecordType()
 			if recordType == "" {
@@ -1197,6 +1203,9 @@ func (cm *cacheManager) pruneOnce(ctx context.Context, ch chan client.UsageInfo,
 
 	if len(toDelete) > 0 {
 		sortDeleteRecords(toDelete)
+		bklog.G(ctx).Infof("prune candidates=%d, deleting=%s lastUsed=%v size=%.2fMB",
+			len(toDelete),
+			toDelete[0].ID(), toDelete[0].lastUsedAt, float64(toDelete[0].getSize())/(1024*1024))
 	}
 	batchSize := len(toDelete)
 	if gcMode && batchSize > 0 {
