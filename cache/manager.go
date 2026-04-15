@@ -1195,10 +1195,12 @@ func (cm *cacheManager) pruneOnce(ctx context.Context, ch chan client.UsageInfo,
 		cr.mu.Unlock()
 	}
 
-	batchSize := len(toDelete)
-	if gcMode && len(toDelete) > 0 {
-		batchSize = 1
+	if len(toDelete) > 0 {
 		sortDeleteRecords(toDelete)
+	}
+	batchSize := len(toDelete)
+	if gcMode && batchSize > 0 {
+		batchSize = 1
 	} else if batchSize > maxPruneBatch {
 		batchSize = maxPruneBatch
 	}
