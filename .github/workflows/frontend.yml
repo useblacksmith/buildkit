@@ -42,7 +42,7 @@ jobs:
       codecov_token: ${{ secrets.CODECOV_TOKEN }}
 
   prepare:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       includes: ${{ steps.set.outputs.includes }}
       tag: ${{ steps.set.outputs.tag }}
@@ -188,7 +188,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
   scout:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: ${{ github.repository == 'moby/buildkit' && github.ref == 'refs/heads/master' }}
     permissions:
       # same as global permission
@@ -232,7 +232,7 @@ jobs:
           sarif_file: ${{ steps.scout.outputs.result-file }}
 
   release:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: startsWith(github.ref, 'refs/tags/dockerfile')
     permissions:
       # required to create GitHub release
