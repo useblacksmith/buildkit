@@ -328,6 +328,12 @@ func (w *runcExecutor) Run(ctx context.Context, id string, root executor.Mount, 
 	trace.SpanFromContext(ctx).AddEvent("Container created")
 	err = w.run(ctx, id, bundle, process, func() {
 		startedOnce.Do(func() {
+			// Mirrors the existing "> creating" log line above. The
+			// delta between "creating" and "started" is the runc
+			// bundle setup + exec latency, which is the dominant
+			// budget consumer for the gateway HTTP/2 preface deadline
+			// when the storage backend is contended.
+			bklog.G(ctx).Debugf("> started %s %v", id, meta.Args)
 			trace.SpanFromContext(ctx).AddEvent("Container started")
 			if started != nil {
 				close(started)
