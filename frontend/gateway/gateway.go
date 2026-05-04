@@ -52,6 +52,9 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
 	spb "google.golang.org/genproto/googleapis/rpc/status"
@@ -1720,13 +1723,175 @@ func (lbf *llbBridgeForwarder) cloneRef(id string) (solver.ResultProxy, error) {
 	return s2, nil
 }
 
+// HTTP/2 client preface handling for gateway connections.
+//
+// The vendored golang.org/x/net/http2 package enforces a hard-coded 10s
+// preface timeout in http2.Server.ServeConn (see
+// vendor/golang.org/x/net/http2/server.go: const prefaceTimeout). When
+// buildkitd spawns a frontend container (e.g. dockerfile-frontend) and
+// slow runc bundle setup, overlay-mount, or cold-cache rootfs reads
+// delay the frontend's first preface bytes past 10s, ServeConn aborts
+// with errPrefaceTimeout, the gateway tears down the gRPC connection,
+// and the build fails with `frontend grpc server closed unexpectedly`.
+//
+// The gateway now reads the 24-byte client preface itself with a
+// configurable, longer-by-default deadline, then replays it under a
+// wrapped net.Conn so http2.Server.ServeConn observes the preface
+// instantly from memory and proceeds normally.
+const (
+	// httpClientPreface is the 24-byte HTTP/2 client connection preface,
+	// as defined in RFC 7540 §3.5 and exported in golang.org/x/net/http2
+	// as ClientPreface. The format is fixed by spec.
+	httpClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+	// defaultPrefaceTimeout is the default ceiling on how long the
+	// gateway waits for the frontend container to send its HTTP/2 client
+	// preface. Significantly longer than the vendored 10s upstream
+	// prefaceTimeout to absorb slow runc bundle setup and cold-cache
+	// rootfs reads on contended storage backends.
+	defaultPrefaceTimeout = 60 * time.Second
+
+	// prefaceTimeoutEnvVar lets operators tune the preface wait without a
+	// binary rebuild. Value is parsed as a Go time.Duration string,
+	// e.g. "30s", "2m". Invalid or non-positive values fall back to
+	// defaultPrefaceTimeout.
+	prefaceTimeoutEnvVar = "BUILDKIT_GATEWAY_PREFACE_TIMEOUT"
+)
+
+var (
+	gatewayMeter         = otel.Meter("github.com/moby/buildkit/frontend/gateway")
+	gatewayMetricsOnce   sync.Once
+	prefaceWaitHistogram metric.Float64Histogram
+	prefaceErrorCounter  metric.Int64Counter
+)
+
+func initGatewayMetrics() {
+	gatewayMetricsOnce.Do(func() {
+		if h, err := gatewayMeter.Float64Histogram(
+			"buildkit_frontend_preface_wait_seconds",
+			metric.WithDescription("Time the gateway waited for the HTTP/2 client preface from the frontend container after spawning it."),
+			metric.WithUnit("s"),
+		); err == nil {
+			prefaceWaitHistogram = h
+		}
+		if c, err := gatewayMeter.Int64Counter(
+			"buildkit_frontend_preface_error_total",
+			metric.WithDescription("Number of times the gateway failed to receive the HTTP/2 client preface from the frontend container, partitioned by reason."),
+		); err == nil {
+			prefaceErrorCounter = c
+		}
+	})
+}
+
+// prefaceConn is a net.Conn that returns previously buffered HTTP/2
+// client preface bytes from Read before delegating to the underlying
+// connection, so http2.Server.ServeConn observes the preface
+// synchronously from memory.
+type prefaceConn struct {
+	net.Conn
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (c *prefaceConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	if len(c.buf) > 0 {
+		n := copy(p, c.buf)
+		c.buf = c.buf[n:]
+		c.mu.Unlock()
+		return n, nil
+	}
+	c.mu.Unlock()
+	return c.Conn.Read(p)
+}
+
+// prefaceReadTimeout returns the configured timeout for the gateway's
+// HTTP/2 client preface pre-read. Defaults to defaultPrefaceTimeout,
+// overridable via the BUILDKIT_GATEWAY_PREFACE_TIMEOUT environment
+// variable.
+func prefaceReadTimeout() time.Duration {
+	if v := os.Getenv(prefaceTimeoutEnvVar); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+		bklog.L.Warnf("frontend gateway: invalid %s=%q, falling back to %s", prefaceTimeoutEnvVar, v, defaultPrefaceTimeout)
+	}
+	return defaultPrefaceTimeout
+}
+
+var errPrefaceReadTimeout = errors.New("timed out reading HTTP/2 client preface from frontend container")
+
+// readPrefaceWithTimeout reads exactly len(httpClientPreface) bytes from
+// conn or returns an error after timeout. Mirrors the timer-race
+// approach in vendored x/net/http2/server.go:readPreface, which is
+// required because the gateway's pipe-based net.Conn (see *pipe.conn)
+// overrides the deadline setters to no-op so SetReadDeadline cannot be
+// used to bound the read.
+func readPrefaceWithTimeout(conn net.Conn, timeout time.Duration) ([]byte, error) {
+	buf := make([]byte, len(httpClientPreface))
+	errc := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(conn, buf)
+		errc <- err
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		// Close the underlying connection to unblock the goroutine's
+		// io.ReadFull. errc is buffered so the goroutine will not leak.
+		_ = conn.Close()
+		return nil, errPrefaceReadTimeout
+	case err := <-errc:
+		if err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+}
+
 func serve(ctx context.Context, grpcServer *grpc.Server, conn net.Conn) {
+	initGatewayMetrics()
 	go func() {
 		<-ctx.Done()
 		conn.Close()
 	}()
-	bklog.G(ctx).Debugf("serving grpc connection")
-	(&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{Handler: grpcServer})
+
+	timeout := prefaceReadTimeout()
+	start := time.Now()
+	pre, err := readPrefaceWithTimeout(conn, timeout)
+	elapsed := time.Since(start)
+
+	logger := bklog.G(ctx).
+		WithField("preface_wait_ms", elapsed.Milliseconds()).
+		WithField("preface_timeout_ms", timeout.Milliseconds())
+
+	if err != nil {
+		reason := "read_error"
+		switch {
+		case errors.Is(err, errPrefaceReadTimeout):
+			reason = "timeout"
+		case err == io.EOF, err == io.ErrUnexpectedEOF:
+			reason = "eof"
+		}
+		if prefaceErrorCounter != nil {
+			prefaceErrorCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+		}
+		logger.WithField("preface_error_reason", reason).
+			Warnf("frontend serve: failed to read HTTP/2 client preface from frontend container: %v", err)
+		// ensure conn is closed so the upstream goroutine observes the
+		// failure as server-closed rather than blocking on Run()
+		_ = conn.Close()
+		return
+	}
+
+	if prefaceWaitHistogram != nil {
+		prefaceWaitHistogram.Record(ctx, elapsed.Seconds())
+	}
+	logger.Debugf("frontend serve: received HTTP/2 client preface")
+
+	bufConn := &prefaceConn{Conn: conn, buf: pre}
+	(&http2.Server{}).ServeConn(bufConn, &http2.ServeConnOpts{Handler: grpcServer})
 }
 
 type markTypeFrontend struct{}
