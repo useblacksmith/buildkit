@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"io"
 	"net"
 	"testing"
 	"time"
@@ -47,30 +46,6 @@ func TestCheckSourceIsAllowed(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestPrefaceConnReplaysBufferedBytes(t *testing.T) {
-	// Pair of in-memory net.Conns; we'll wrap one end and verify that
-	// reads on the wrapper first drain a pre-buffered chunk before
-	// falling through to the underlying conn.
-	c1, c2 := net.Pipe()
-	defer c2.Close()
-
-	const buffered = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-	const trailing = "DATA-AFTER-PREFACE"
-	pc := &prefaceConn{Conn: c1, buf: []byte(buffered)}
-
-	// Writer goroutine pushes the trailing payload to the underlying conn,
-	// then closes c2 so io.ReadAll terminates after draining the wrapper's
-	// buffer and the trailing bytes from c1.
-	go func() {
-		_, _ = c2.Write([]byte(trailing))
-		_ = c2.Close()
-	}()
-
-	out, err := io.ReadAll(pc)
-	require.NoError(t, err)
-	require.Equal(t, buffered+trailing, string(out))
-}
-
 func TestReadPrefaceWithTimeoutSuccess(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
@@ -82,9 +57,7 @@ func TestReadPrefaceWithTimeoutSuccess(t *testing.T) {
 		_, _ = c2.Write(preface)
 	}()
 
-	got, err := readPrefaceWithTimeout(c1, 5*time.Second)
-	require.NoError(t, err)
-	require.Equal(t, preface, got)
+	require.NoError(t, readPrefaceWithTimeout(c1, 5*time.Second))
 }
 
 func TestReadPrefaceWithTimeoutFiresOnSlowSender(t *testing.T) {
@@ -93,7 +66,7 @@ func TestReadPrefaceWithTimeoutFiresOnSlowSender(t *testing.T) {
 
 	// Sender writes nothing; the timer race must fire and close c1.
 	start := time.Now()
-	_, err := readPrefaceWithTimeout(c1, 50*time.Millisecond)
+	err := readPrefaceWithTimeout(c1, 50*time.Millisecond)
 	elapsed := time.Since(start)
 
 	require.ErrorIs(t, err, errPrefaceReadTimeout)
@@ -104,6 +77,21 @@ func TestReadPrefaceWithTimeoutFiresOnSlowSender(t *testing.T) {
 	// to unblock the inner io.ReadFull goroutine.
 	_, werr := c1.Write([]byte("x"))
 	require.Error(t, werr)
+}
+
+func TestReadPrefaceWithTimeoutMismatch(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	// Sender writes 24 bytes that do NOT match the HTTP/2 client preface.
+	bogus := []byte("NOT-A-VALID-PREFACE-XXXX")
+	require.Equal(t, len("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), len(bogus))
+	go func() {
+		_, _ = c2.Write(bogus)
+	}()
+
+	require.ErrorIs(t, readPrefaceWithTimeout(c1, 5*time.Second), errPrefaceMismatch)
 }
 
 func TestPrefaceReadTimeoutEnvOverride(t *testing.T) {

@@ -1783,28 +1783,6 @@ func initGatewayMetrics() {
 	})
 }
 
-// prefaceConn is a net.Conn that returns previously buffered HTTP/2
-// client preface bytes from Read before delegating to the underlying
-// connection, so http2.Server.ServeConn observes the preface
-// synchronously from memory.
-type prefaceConn struct {
-	net.Conn
-	mu  sync.Mutex
-	buf []byte
-}
-
-func (c *prefaceConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	if len(c.buf) > 0 {
-		n := copy(p, c.buf)
-		c.buf = c.buf[n:]
-		c.mu.Unlock()
-		return n, nil
-	}
-	c.mu.Unlock()
-	return c.Conn.Read(p)
-}
-
 // prefaceReadTimeout returns the configured timeout for the gateway's
 // HTTP/2 client preface pre-read. Defaults to defaultPrefaceTimeout,
 // overridable via the BUILDKIT_GATEWAY_PREFACE_TIMEOUT environment
@@ -1819,15 +1797,19 @@ func prefaceReadTimeout() time.Duration {
 	return defaultPrefaceTimeout
 }
 
-var errPrefaceReadTimeout = errors.New("timed out reading HTTP/2 client preface from frontend container")
+var (
+	errPrefaceReadTimeout = errors.New("timed out reading HTTP/2 client preface from frontend container")
+	errPrefaceMismatch    = errors.New("frontend container did not send a valid HTTP/2 client preface")
+)
 
 // readPrefaceWithTimeout reads exactly len(httpClientPreface) bytes from
 // conn or returns an error after timeout. Mirrors the timer-race
 // approach in vendored x/net/http2/server.go:readPreface, which is
 // required because the gateway's pipe-based net.Conn (see *pipe.conn)
 // overrides the deadline setters to no-op so SetReadDeadline cannot be
-// used to bound the read.
-func readPrefaceWithTimeout(conn net.Conn, timeout time.Duration) ([]byte, error) {
+// used to bound the read. The returned bytes are validated against
+// httpClientPreface; a mismatch returns errPrefaceMismatch.
+func readPrefaceWithTimeout(conn net.Conn, timeout time.Duration) error {
 	buf := make([]byte, len(httpClientPreface))
 	errc := make(chan error, 1)
 	go func() {
@@ -1841,12 +1823,15 @@ func readPrefaceWithTimeout(conn net.Conn, timeout time.Duration) ([]byte, error
 		// Close the underlying connection to unblock the goroutine's
 		// io.ReadFull. errc is buffered so the goroutine will not leak.
 		_ = conn.Close()
-		return nil, errPrefaceReadTimeout
+		return errPrefaceReadTimeout
 	case err := <-errc:
 		if err != nil {
-			return nil, err
+			return err
 		}
-		return buf, nil
+		if string(buf) != httpClientPreface {
+			return errPrefaceMismatch
+		}
+		return nil
 	}
 }
 
@@ -1859,7 +1844,7 @@ func serve(ctx context.Context, grpcServer *grpc.Server, conn net.Conn) {
 
 	timeout := prefaceReadTimeout()
 	start := time.Now()
-	pre, err := readPrefaceWithTimeout(conn, timeout)
+	err := readPrefaceWithTimeout(conn, timeout)
 	elapsed := time.Since(start)
 
 	logger := bklog.G(ctx).
@@ -1871,6 +1856,8 @@ func serve(ctx context.Context, grpcServer *grpc.Server, conn net.Conn) {
 		switch {
 		case errors.Is(err, errPrefaceReadTimeout):
 			reason = "timeout"
+		case errors.Is(err, errPrefaceMismatch):
+			reason = "mismatch"
 		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 			reason = "eof"
 		}
@@ -1890,8 +1877,14 @@ func serve(ctx context.Context, grpcServer *grpc.Server, conn net.Conn) {
 	}
 	logger.Debugf("frontend serve: received HTTP/2 client preface")
 
-	bufConn := &prefaceConn{Conn: conn, buf: pre}
-	(&http2.Server{}).ServeConn(bufConn, &http2.ServeConnOpts{Handler: grpcServer})
+	// SawClientPreface tells http2.Server.ServeConn that the 24-byte
+	// HTTP/2 client preface has already been consumed from conn, so its
+	// internal readPreface() returns nil immediately and skips the
+	// hard-coded 10s prefaceTimeout.
+	(&http2.Server{}).ServeConn(conn, &http2.ServeConnOpts{
+		Handler:          grpcServer,
+		SawClientPreface: true,
+	})
 }
 
 type markTypeFrontend struct{}
