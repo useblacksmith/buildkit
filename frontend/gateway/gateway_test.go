@@ -3,7 +3,6 @@ package gateway
 import (
 	"io"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -59,20 +58,17 @@ func TestPrefaceConnReplaysBufferedBytes(t *testing.T) {
 	const trailing = "DATA-AFTER-PREFACE"
 	pc := &prefaceConn{Conn: c1, buf: []byte(buffered)}
 
-	// Writer goroutine pushes the trailing payload to the underlying conn
-	// after the wrapper has had a chance to drain its buffer.
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// Writer goroutine pushes the trailing payload to the underlying conn,
+	// then closes c2 so io.ReadAll terminates after draining the wrapper's
+	// buffer and the trailing bytes from c1.
 	go func() {
-		defer wg.Done()
 		_, _ = c2.Write([]byte(trailing))
-		c2.Close()
+		_ = c2.Close()
 	}()
 
 	out, err := io.ReadAll(pc)
 	require.NoError(t, err)
 	require.Equal(t, buffered+trailing, string(out))
-	wg.Wait()
 }
 
 func TestReadPrefaceWithTimeoutSuccess(t *testing.T) {
