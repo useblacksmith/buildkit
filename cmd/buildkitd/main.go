@@ -68,6 +68,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -296,6 +297,13 @@ func main() {
 			return err
 		}
 		closers = append(closers, mp.Shutdown)
+
+		// Register the meter provider globally so that callers using
+		// otel.Meter(...) (e.g. frontend/gateway preface metrics) see
+		// the configured Prometheus + OTLP readers instead of the
+		// no-op default. Without this, otel.Meter(...) returns a
+		// no-op meter and instrument recordings are silently dropped.
+		otel.SetMeterProvider(mp)
 
 		statsHandler := tracing.ServerStatsHandler(
 			otelgrpc.WithTracerProvider(tp),

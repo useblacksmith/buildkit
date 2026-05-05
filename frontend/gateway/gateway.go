@@ -1735,9 +1735,11 @@ func (lbf *llbBridgeForwarder) cloneRef(id string) (solver.ResultProxy, error) {
 // and the build fails with `frontend grpc server closed unexpectedly`.
 //
 // The gateway now reads the 24-byte client preface itself with a
-// configurable, longer-by-default deadline, then replays it under a
-// wrapped net.Conn so http2.Server.ServeConn observes the preface
-// instantly from memory and proceeds normally.
+// configurable, longer-by-default deadline, validates it, and then
+// hands the already-drained net.Conn straight to http2.Server.ServeConn
+// with ServeConnOpts.SawClientPreface=true. With that flag set, the
+// vendored readPreface() returns nil immediately and skips the
+// hard-coded 10s prefaceTimeout entirely.
 const (
 	// httpClientPreface is the 24-byte HTTP/2 client connection preface,
 	// as defined in RFC 7540 §3.5 and exported in golang.org/x/net/http2
