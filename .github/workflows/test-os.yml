@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022]
+        os: [blacksmith-4vcpu-windows-2025]
         worker:
           - containerd
         pkg:
@@ -107,7 +107,7 @@ jobs:
           - ./frontend/dockerfile#11-12
           - ./frontend/dockerfile#12-12
         include:
-          - os: windows-2022
+          - os: blacksmith-4vcpu-windows-2025
             worker: containerd
             pkg: ./...
             skip-integration-tests: 1
