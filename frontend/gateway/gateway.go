@@ -505,6 +505,42 @@ type conn struct {
 	io.Closer
 }
 
+// Close closes all three underlying file descriptors, not just the
+// io.Closer field. This matters because newPipe builds the conn from
+// two os.Pipe() pairs: the Reader and Closer are different ends of
+// different pipes (pr2 and pw2 respectively), and the other ends
+// (pw2 inherited as Stdout, pr1 inherited as Stdin) are passed to the
+// spawned frontend container's runc process. Closing only the Closer
+// (the previous, promoted-method behavior) does not cause the
+// in-process Reader to see EOF, because the frontend process still
+// holds a duplicate fd of that pipe end via its inherited Stdout.
+// readPrefaceWithTimeout's timeout path relies on Close to unblock
+// its io.ReadFull goroutine reading from Reader; closing the Reader
+// fd directly causes any in-flight or subsequent Read to return
+// immediately with a closed-pipe error, which is the documented
+// behavior of os.File.Close while another goroutine is in Read.
+//
+// Concurrent and repeated calls are safe: os.File handles internal
+// synchronisation, and existing call sites (defer lbf.conn.Close,
+// the ctx.Done goroutine in serve, and read-error paths) ignore the
+// returned error.
+func (s *conn) Close() error {
+	var firstErr error
+	closeIfCloser := func(v any) {
+		if c, ok := v.(io.Closer); ok {
+			if err := c.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	closeIfCloser(s.Reader)
+	closeIfCloser(s.Writer)
+	if err := s.Closer.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
 func (s *conn) LocalAddr() net.Addr {
 	return dummyAddr{}
 }
@@ -1807,7 +1843,7 @@ var (
 // readPrefaceWithTimeout reads exactly len(httpClientPreface) bytes from
 // conn or returns an error after timeout. Mirrors the timer-race
 // approach in vendored x/net/http2/server.go:readPreface, which is
-// required because the gateway's pipe-based net.Conn (see *pipe.conn)
+// required because the gateway's pipe-based net.Conn (see *conn above)
 // overrides the deadline setters to no-op so SetReadDeadline cannot be
 // used to bound the read. The returned bytes are validated against
 // httpClientPreface; a mismatch returns errPrefaceMismatch.
@@ -1822,8 +1858,16 @@ func readPrefaceWithTimeout(conn net.Conn, timeout time.Duration) error {
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		// Close the underlying connection to unblock the goroutine's
-		// io.ReadFull. errc is buffered so the goroutine will not leak.
+		// Close the underlying connection to unblock the io.ReadFull
+		// goroutine reading from conn. *conn.Close (defined above)
+		// closes the Reader fd directly, which causes the in-flight
+		// Read to return immediately with a closed-pipe error so the
+		// goroutine returns and writes to the buffered errc channel.
+		// errc is sized 1 so even if conn.Close were a no-op (e.g. a
+		// hypothetical net.Conn implementation that doesn't unblock
+		// Read on Close), the goroutine would still not leak: it would
+		// remain parked on the Read until the underlying transport
+		// closes, then write to the already-buffered channel and exit.
 		_ = conn.Close()
 		return errPrefaceReadTimeout
 	case err := <-errc:
