@@ -137,6 +137,8 @@ jobs:
           typ: integration
     secrets:
       codecov_token: ${{ secrets.CODECOV_TOKEN }}
+      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
 
   govulncheck:
     runs-on: blacksmith-4vcpu-ubuntu-2404

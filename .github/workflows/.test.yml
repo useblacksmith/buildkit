@@ -28,6 +28,10 @@ on:
     secrets:
       codecov_token:
         required: false
+      dockerhub_username:
+        required: false
+      dockerhub_token:
+        required: false
 
 env:
   GO_VERSION: "1.26"
@@ -43,6 +47,13 @@ jobs:
       tags: ${{ steps.set.outputs.tags }}
       includes: ${{ steps.set.outputs.includes }}
     steps:
+      -
+        name: Login to DockerHub
+        if: ${{ secrets.dockerhub_token != '' }}
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
       -
         name: Set up QEMU
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
@@ -127,6 +138,13 @@ jobs:
         tags: ${{ fromJson(needs.prepare.outputs.tags) }}
         include: ${{ fromJson(needs.prepare.outputs.includes) }}
     steps:
+      -
+        name: Login to DockerHub
+        if: ${{ secrets.dockerhub_token != '' }}
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
       -
         name: Prepare
         env:
