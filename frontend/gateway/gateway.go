@@ -1871,7 +1871,7 @@ func serve(ctx context.Context, grpcServer *grpc.Server, conn net.Conn) {
 		switch {
 		case errors.Is(err, errPrefaceReadTimeout):
 			reason = "timeout"
-		case err == io.EOF, err == io.ErrUnexpectedEOF:
+		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 			reason = "eof"
 		}
 		if prefaceErrorCounter != nil {

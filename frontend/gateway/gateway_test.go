@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"errors"
 	"io"
 	"net"
 	"sync"
@@ -101,8 +100,7 @@ func TestReadPrefaceWithTimeoutFiresOnSlowSender(t *testing.T) {
 	_, err := readPrefaceWithTimeout(c1, 50*time.Millisecond)
 	elapsed := time.Since(start)
 
-	require.Error(t, err)
-	require.True(t, errors.Is(err, errPrefaceReadTimeout), "expected errPrefaceReadTimeout, got %v", err)
+	require.ErrorIs(t, err, errPrefaceReadTimeout)
 	require.GreaterOrEqual(t, elapsed, 40*time.Millisecond)
 	require.Less(t, elapsed, 2*time.Second)
 
