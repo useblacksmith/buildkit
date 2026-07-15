@@ -142,9 +142,9 @@ func monitorHealth(ctx context.Context, cc *grpc.ClientConn, cancelConn func(err
 
 			timeout := time.Duration(math.Max(float64(cfg.timeout), float64(lastHealthcheckDuration)*1.5))
 
-			ctx, cancel := context.WithCancelCause(ctx)
-			ctx, _ = context.WithTimeoutCause(ctx, timeout, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
-			_, err := healthClient.Check(ctx, &grpc_health_v1.HealthCheckRequest{})
+			checkCtx, cancel := context.WithCancelCause(ctx)
+			checkCtx, _ = context.WithTimeoutCause(checkCtx, timeout, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
+			_, err := healthClient.Check(checkCtx, &grpc_health_v1.HealthCheckRequest{})
 			cancel(errors.WithStack(context.Canceled))
 
 			lastHealthcheckDuration = time.Since(healthcheckStart)
