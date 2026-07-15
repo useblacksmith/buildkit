@@ -4,6 +4,9 @@ import (
 	"context"
 	"math"
 	"net"
+	"os"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -68,17 +71,63 @@ func grpcClientConn(ctx context.Context, conn net.Conn) (context.Context, *grpc.
 	return ctx, cc, nil
 }
 
+// Session healthcheck tunables, overridable via environment variables so a
+// daemon serving builds on memory-constrained machines can tolerate longer
+// client stalls (e.g. page-cache thrashing) without dropping the session that
+// carries registry credentials for the final push.
+const (
+	envHealthcheckInterval    = "BUILDKIT_SESSION_HEALTHCHECK_INTERVAL"
+	envHealthcheckTimeout     = "BUILDKIT_SESSION_HEALTHCHECK_TIMEOUT"
+	envHealthcheckMaxFailures = "BUILDKIT_SESSION_HEALTHCHECK_MAX_FAILURES"
+)
+
+type healthcheckConfig struct {
+	interval    time.Duration
+	timeout     time.Duration
+	maxFailures int
+}
+
+var getHealthcheckConfig = sync.OnceValue(func() healthcheckConfig {
+	cfg := healthcheckConfig{
+		interval:    5 * time.Second,
+		timeout:     30 * time.Second,
+		maxFailures: 2,
+	}
+	if v := os.Getenv(envHealthcheckInterval); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.interval = d
+		} else {
+			bklog.L.Warnf("invalid %s value %q, using default %s", envHealthcheckInterval, v, cfg.interval)
+		}
+	}
+	if v := os.Getenv(envHealthcheckTimeout); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.timeout = d
+		} else {
+			bklog.L.Warnf("invalid %s value %q, using default %s", envHealthcheckTimeout, v, cfg.timeout)
+		}
+	}
+	if v := os.Getenv(envHealthcheckMaxFailures); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.maxFailures = n
+		} else {
+			bklog.L.Warnf("invalid %s value %q, using default %d", envHealthcheckMaxFailures, v, cfg.maxFailures)
+		}
+	}
+	return cfg
+})
+
 func monitorHealth(ctx context.Context, cc *grpc.ClientConn, cancelConn func(error)) {
 	defer cancelConn(errors.WithStack(context.Canceled))
 	defer cc.Close()
 
-	ticker := time.NewTicker(5 * time.Second)
+	cfg := getHealthcheckConfig()
+	ticker := time.NewTicker(cfg.interval)
 	defer ticker.Stop()
 	healthClient := grpc_health_v1.NewHealthClient(cc)
 
-	failedBefore := false
+	consecutiveFailures := 0
 	consecutiveSuccessful := 0
-	defaultHealthcheckDuration := 30 * time.Second
 	lastHealthcheckDuration := time.Duration(0)
 
 	for {
@@ -91,11 +140,11 @@ func monitorHealth(ctx context.Context, cc *grpc.ClientConn, cancelConn func(err
 
 			healthcheckStart := time.Now()
 
-			timeout := time.Duration(math.Max(float64(defaultHealthcheckDuration), float64(lastHealthcheckDuration)*1.5))
+			timeout := time.Duration(math.Max(float64(cfg.timeout), float64(lastHealthcheckDuration)*1.5))
 
-			ctx, cancel := context.WithCancelCause(ctx)
-			ctx, _ = context.WithTimeoutCause(ctx, timeout, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
-			_, err := healthClient.Check(ctx, &grpc_health_v1.HealthCheckRequest{})
+			checkCtx, cancel := context.WithCancelCause(ctx)
+			checkCtx, _ = context.WithTimeoutCause(checkCtx, timeout, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
+			_, err := healthClient.Check(checkCtx, &grpc_health_v1.HealthCheckRequest{})
 			cancel(errors.WithStack(context.Canceled))
 
 			lastHealthcheckDuration = time.Since(healthcheckStart)
@@ -110,19 +159,19 @@ func monitorHealth(ctx context.Context, cc *grpc.ClientConn, cancelConn func(err
 					return
 				default:
 				}
-				if failedBefore {
-					bklog.G(ctx).Error("healthcheck failed fatally")
+				consecutiveFailures++
+				consecutiveSuccessful = 0
+				if consecutiveFailures >= cfg.maxFailures {
+					bklog.G(ctx).WithFields(logFields).Errorf("healthcheck failed fatally after %d consecutive failures", consecutiveFailures)
 					return
 				}
 
-				failedBefore = true
-				consecutiveSuccessful = 0
 				bklog.G(ctx).WithFields(logFields).Warn("healthcheck failed")
 			} else {
 				consecutiveSuccessful++
 
-				if consecutiveSuccessful >= 5 && failedBefore {
-					failedBefore = false
+				if consecutiveSuccessful >= 5 && consecutiveFailures > 0 {
+					consecutiveFailures = 0
 					bklog.G(ctx).WithFields(logFields).Debug("reset healthcheck failure")
 				}
 			}
