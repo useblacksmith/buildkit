@@ -143,6 +143,10 @@ type OCIConfig struct {
 
 	// MaxParallelism is the maximum number of parallel build steps that can be run at the same time.
 	MaxParallelism int `toml:"max-parallelism"`
+
+	// PruneInUse allows a size-bounded `prune --all` (keep-storage) to remove
+	// records that still have live references. Defaults to true.
+	PruneInUse *bool `toml:"pruneInUse"`
 }
 
 type ContainerdConfig struct {

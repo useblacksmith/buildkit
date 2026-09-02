@@ -62,6 +62,7 @@ type cmOpt struct {
 	snapshotterName string
 	snapshotter     snapshots.Snapshotter
 	tmpdir          string
+	pruneInUse      bool
 }
 
 type cmOut struct {
@@ -154,6 +155,7 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, c
 		Differ:         differ,
 		Root:           tmpdir,
 		MountPoolRoot:  filepath.Join(tmpdir, "cachemounts"),
+		PruneInUse:     opt.pruneInUse,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -966,6 +968,103 @@ func TestPrune(t *testing.T) {
 	dirs, err = os.ReadDir(filepath.Join(tmpdir, "snapshots/snapshots"))
 	require.NoError(t, err)
 	require.Equal(t, 0, len(dirs))
+}
+
+// commitWithFile creates a committed layer on top of parent containing a
+// single file of the given size so that the record has a non-zero disk usage.
+func commitWithFile(ctx context.Context, t *testing.T, cm Manager, parent ImmutableRef, name string, size int) ImmutableRef {
+	active, err := cm.New(ctx, parent, nil, CachePolicyRetain)
+	require.NoError(t, err)
+
+	m, err := active.Mount(ctx, false, nil)
+	require.NoError(t, err)
+	lm := snapshot.LocalMounter(m)
+	target, err := lm.Mount()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(target, name), make([]byte, size), 0600))
+	require.NoError(t, lm.Unmount())
+
+	snap, err := active.Commit(ctx)
+	require.NoError(t, err)
+	return snap
+}
+
+func testPruneKeepStorageWithChain(t *testing.T, pruneInUse bool) {
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		snapshotterName: "native",
+		pruneInUse:      pruneInUse,
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager
+
+	parent := commitWithFile(ctx, t, cm, nil, "parent", 4096)
+	child := commitWithFile(ctx, t, cm, parent, "child", 4096)
+
+	// the child record keeps a structural ref on the parent; drop the
+	// test's own handles so the child becomes a leaf with no refs.
+	require.NoError(t, parent.Release(ctx))
+	require.NoError(t, child.Release(ctx))
+
+	// mark the child as used so it sorts after the never-used parent
+	ref, err := cm.Get(ctx, child.ID(), nil)
+	require.NoError(t, err)
+	require.NoError(t, ref.Release(ctx))
+
+	checkDiskUsage(ctx, t, cm, 0, 2)
+
+	// lazily committed layers are reported under their mutable record's ID,
+	// so resolve the IDs from DiskUsage rather than from the handles.
+	du, err := cm.DiskUsage(ctx, client.DiskUsageInfo{})
+	require.NoError(t, err)
+	var total int64
+	var parentID, childID string
+	for _, r := range du {
+		total += r.Size
+		if len(r.Parents) == 0 {
+			parentID = r.ID
+		} else {
+			childID = r.ID
+		}
+	}
+	require.Greater(t, total, int64(1))
+	require.NotEmpty(t, parentID)
+	require.NotEmpty(t, childID)
+
+	// a cap one byte below the total forces exactly one record to be removed
+	buf := pruneResultBuffer()
+	err = cm.Prune(ctx, buf.C, client.PruneInfo{All: true, MaxUsedSpace: total - 1})
+	buf.close()
+	require.NoError(t, err)
+	require.Len(t, buf.all, 1)
+
+	du, err = cm.DiskUsage(ctx, client.DiskUsageInfo{})
+	require.NoError(t, err)
+	require.Len(t, du, 1)
+
+	if pruneInUse {
+		// the in-use parent was removed while the child still points at it
+		require.Equal(t, parentID, buf.all[0].ID)
+		require.Equal(t, childID, du[0].ID)
+		require.Equal(t, []string{parentID}, du[0].Parents)
+	} else {
+		// upstream semantics: only the unreferenced leaf is eligible
+		require.Equal(t, childID, buf.all[0].ID)
+		require.Equal(t, parentID, du[0].ID)
+		require.False(t, du[0].InUse)
+	}
+}
+
+func TestPruneKeepStorageLeafFirst(t *testing.T) {
+	t.Parallel()
+	testPruneKeepStorageWithChain(t, false)
+}
+
+func TestPruneKeepStorageInUseDiskUsage(t *testing.T) {
+	t.Parallel()
+	testPruneKeepStorageWithChain(t, true)
 }
 
 func TestLazyCommit(t *testing.T) {
