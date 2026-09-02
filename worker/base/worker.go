@@ -86,6 +86,7 @@ type WorkerOpt struct {
 	MountPoolRoot    string
 	ResourceMonitor  *resources.Monitor
 	CDIManager       *cdidevices.Manager
+	PruneInUse       bool
 }
 
 // Worker is a local worker instance with dedicated snapshotter, cache, and so on.
@@ -119,6 +120,7 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 		MetadataStore:   opt.MetadataStore,
 		Root:            opt.Root,
 		MountPoolRoot:   opt.MountPoolRoot,
+		PruneInUse:      opt.PruneInUse,
 	})
 	if err != nil {
 		return nil, err

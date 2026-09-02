@@ -55,6 +55,9 @@ type ManagerOpt struct {
 	MetadataStore   *metadata.Store
 	Root            string
 	MountPoolRoot   string
+	// PruneInUse lets a size-bounded prune with all=true remove records that
+	// still have live refs (e.g. held by child records or an active solve).
+	PruneInUse bool
 }
 
 type Accessor interface {
@@ -99,7 +102,8 @@ type cacheManager struct {
 	Differ          diff.Comparer
 	MetadataStore   *metadata.Store
 
-	root string
+	root       string
+	pruneInUse bool
 
 	mountPool sharableMountPool
 
@@ -118,6 +122,7 @@ func NewManager(opt ManagerOpt) (Manager, error) {
 		Differ:          opt.Differ,
 		MetadataStore:   opt.MetadataStore,
 		root:            opt.Root,
+		pruneInUse:      opt.PruneInUse,
 		records:         make(map[string]*cacheRecord),
 	}
 
@@ -1145,7 +1150,7 @@ func (cm *cacheManager) pruneOnce(ctx context.Context, ch chan client.UsageInfo,
 			continue
 		}
 
-		if len(cr.refs) > 0 && (!opt.all || opt.keepBytes == 0) {
+		if len(cr.refs) > 0 && (!cm.pruneInUse || !opt.all || opt.keepBytes == 0) {
 			cr.mu.Unlock()
 			continue
 		}
@@ -1444,9 +1449,15 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 			v := m[id]
 			if v.refs == 0 {
 				for _, p := range v.parents {
-					m[p].refs--
+					// a parent may already have been pruned out from under
+					// this record; skip it rather than dereferencing nil
+					pv, ok := m[p]
+					if !ok {
+						continue
+					}
+					pv.refs--
 					if v.doubleRef {
-						m[p].refs--
+						pv.refs--
 					}
 					rescan[p] = struct{}{}
 				}

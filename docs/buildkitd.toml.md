@@ -99,6 +99,9 @@ provenanceEnvDir = "/etc/buildkit/provenance.d"
   apparmor-profile = ""
   # limit the number of parallel build steps that can run at the same time
   max-parallelism = 4
+  # allow a size-bounded `prune --all` (keep-storage) to remove records that
+  # still have live references. Set to false for upstream leaf-first semantics.
+  pruneInUse = true
   # maintain a pool of reusable CNI network namespaces to amortize the overhead
   # of allocating and releasing the namespaces
   cniPoolSize = 16
