@@ -822,9 +822,9 @@ func (h *Queue) Listen(ctx context.Context, req *controlapi.BuildHistoryRequest,
 		defer func() {
 			h.mu.Lock()
 			h.refs[req.Ref]--
-			if _, ok := h.deleted[req.Ref]; ok {
-				if h.refs[req.Ref] == 0 {
-					delete(h.refs, req.Ref)
+			if h.refs[req.Ref] == 0 {
+				delete(h.refs, req.Ref)
+				if _, ok := h.deleted[req.Ref]; ok {
 					h.delete(req.Ref)
 				}
 			}

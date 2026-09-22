@@ -50,6 +50,7 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 	// client_control_test.go
 	testCallInfo,
 	testClientCustomGRPCOpts,
+	testDeleteBuildHistoryAfterListenerExit,
 	testListenBuildHistoryExcludesSoftDeletedRecords,
 
 	// client_diskusage_test.go
