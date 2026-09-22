@@ -264,6 +264,7 @@ var allTests = []func(t *testing.T, sb integration.Sandbox){
 	testSourcePolicySignedCommit,
 	testSourcePolicySessionHTTPChecksumAssist,
 	testSourcePolicySessionConvert,
+	testDeleteBuildHistoryAfterListenerExit,
 	testListenBuildHistoryExcludesSoftDeletedRecords,
 }
 
@@ -13602,6 +13603,80 @@ func testListenBuildHistoryExcludesSoftDeletedRecords(t *testing.T, sb integrati
 		if _, err := cl.Recv(); err != nil {
 			break
 		}
+	}
+}
+
+func testDeleteBuildHistoryAfterListenerExit(t *testing.T, sb integration.Sandbox) {
+	c, err := New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	def, err := llb.Scratch().File(llb.Mkfile("file", 0o644, nil)).Marshal(sb.Context())
+	require.NoError(t, err)
+
+	ref := identity.NewID()
+	_, err = c.Solve(sb.Context(), def, SolveOpt{Ref: ref}, nil)
+	require.NoError(t, err)
+
+	// Listen on the ref and let the stream finish, as buildx does when
+	// resolving provenance after a build. Draining to EOF guarantees the
+	// server-side listener has exited before the delete below.
+	cl, err := c.ControlClient().ListenBuildHistory(sb.Context(), &controlapi.BuildHistoryRequest{
+		Ref:       ref,
+		EarlyExit: true,
+	})
+	require.NoError(t, err)
+	_, err = cl.Recv()
+	require.NoError(t, err)
+	_, err = cl.Recv()
+	require.ErrorIs(t, err, io.EOF)
+
+	// A streaming listener with no ref filter observes the DELETED event
+	// only when the record is actually removed. Reading the initial record
+	// ensures the listener is subscribed before the delete is issued.
+	eventsCtx, eventsCancel := context.WithCancelCause(sb.Context())
+	defer eventsCancel(nil)
+	events, err := c.ControlClient().ListenBuildHistory(eventsCtx, &controlapi.BuildHistoryRequest{})
+	require.NoError(t, err)
+	ev, err := events.Recv()
+	require.NoError(t, err)
+	require.Equal(t, ref, ev.Record.Ref)
+
+	_, err = c.ControlClient().UpdateBuildHistory(sb.Context(), &controlapi.UpdateBuildHistoryRequest{
+		Ref:    ref,
+		Delete: true,
+	})
+	require.NoError(t, err)
+
+	// With no listener left the delete must be immediate, not deferred: the
+	// ref is neither reported as pending deletion nor present in the store.
+	history, err := c.ControlClient().ListenBuildHistory(sb.Context(), &controlapi.BuildHistoryRequest{
+		Ref:       ref,
+		EarlyExit: true,
+	})
+	require.NoError(t, err)
+	_, err = history.Recv()
+	require.ErrorIs(t, err, io.EOF)
+
+	deleted := make(chan error, 1)
+	go func() {
+		for {
+			ev, err := events.Recv()
+			if err != nil {
+				deleted <- err
+				return
+			}
+			if ev.Type == controlapi.BuildHistoryEventType_DELETED && ev.Record.Ref == ref {
+				deleted <- nil
+				return
+			}
+		}
+	}()
+	select {
+	case err := <-deleted:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatalf("no DELETED event received for ref %s", ref)
 	}
 }
 
