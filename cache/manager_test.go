@@ -2557,6 +2557,88 @@ func TestLoadBrokenParents(t *testing.T) {
 	require.Len(t, refA.(*immutableRef).refs, 1)
 }
 
+func TestPruneReloadedChildKeepsParentLastUsed(t *testing.T) {
+	// Parent refs of records loaded from the metadata store must not update
+	// the parent's lastUsedAt when they are released, otherwise pruning a
+	// child refreshes its parent and time-based pruning can only ever remove
+	// one layer of a stale chain per keepDuration.
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	tmpdir := t.TempDir()
+
+	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, snapshotter.Close())
+	})
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		tmpdir:          tmpdir,
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	cm := co.manager
+
+	active, err := cm.New(ctx, nil, nil, CachePolicyRetain)
+	require.NoError(t, err)
+	parent, err := active.Commit(ctx)
+	require.NoError(t, err)
+	require.NoError(t, parent.Finalize(ctx))
+
+	active, err = cm.New(ctx, parent, nil, CachePolicyRetain)
+	require.NoError(t, err)
+	child, err := active.Commit(ctx)
+	require.NoError(t, err)
+	require.NoError(t, child.Finalize(ctx))
+
+	parentID, childID := parent.ID(), child.ID()
+	require.NoError(t, child.Release(ctx))
+	require.NoError(t, parent.Release(ctx))
+
+	usageByID := func() map[string]*client.UsageInfo {
+		du, err := cm.DiskUsage(ctx, client.DiskUsageInfo{})
+		require.NoError(t, err)
+		m := make(map[string]*client.UsageInfo, len(du))
+		for _, u := range du {
+			m[u.ID] = u
+		}
+		return m
+	}
+
+	before := usageByID()
+	require.Contains(t, before, parentID)
+	require.Contains(t, before, childID)
+	require.NotNil(t, before[parentID].LastUsedAt)
+
+	require.NoError(t, cm.Close())
+	cleanup()
+
+	co, cleanup, err = newCacheManager(ctx, t, cmOpt{
+		tmpdir:          tmpdir,
+		snapshotter:     snapshotter,
+		snapshotterName: "native",
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm = co.manager
+
+	buf := pruneResultBuffer()
+	err = cm.Prune(ctx, buf.C, client.PruneInfo{Filter: []string{"id==" + childID}})
+	buf.close()
+	require.NoError(t, err)
+	require.Len(t, buf.all, 1)
+	require.Equal(t, childID, buf.all[0].ID)
+
+	after := usageByID()
+	require.Contains(t, after, parentID)
+	require.NotContains(t, after, childID)
+	require.Equal(t, before[parentID].UsageCount, after[parentID].UsageCount)
+	require.Equal(t, before[parentID].LastUsedAt.UnixNano(), after[parentID].LastUsedAt.UnixNano())
+}
+
 func TestCalculateKeepBytes(t *testing.T) {
 	ts := []struct {
 		name      string
