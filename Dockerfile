@@ -167,7 +167,26 @@ ARG TARGETOS
 ARG TARGETARCH
 ARG TARGETPLATFORM
 WORKDIR /opt/cni/bin
-RUN curl -fsSL https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-${TARGETOS}-${TARGETARCH}-${CNI_VERSION}.tgz | tar xzv
+# Checksums come from the .sha256 files published with each upstream release.
+# Update them together with CNI_VERSION.
+RUN <<EOT
+  set -e
+  case "${CNI_VERSION}-${TARGETOS}-${TARGETARCH}" in
+    v1.9.1-linux-amd64)    sha256=b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303 ;;
+    v1.9.1-linux-arm)      sha256=21416880bea0541d78afaf106373d6dbb471edb92c0114fa263494fe4aec8d3b ;;
+    v1.9.1-linux-arm64)    sha256=56171987d3947707c3563db2f4001bccaf50fd63468611b9f3cbecb1375ee7ec ;;
+    v1.9.1-linux-mips64le) sha256=27b8bc84bb7d46ce7db101e20bc1909668c61a330857f72fc2744ad1c360a686 ;;
+    v1.9.1-linux-ppc64le)  sha256=44b743ff6e4dc145eb4e5280e49eca182fcc586d8d52ab431d5904b66e5ca6f7 ;;
+    v1.9.1-linux-riscv64)  sha256=8ae4f284805187106596678959807df8c61a2f7bd12d323b45c5f0c1f51d41cd ;;
+    v1.9.1-linux-s390x)    sha256=5da91ae1b8a0a80fd83077c012bbfacc685e46c3abda72b1fdc1748e6c20fb0d ;;
+    *) echo >&2 "no pinned sha256 for cni-plugins ${CNI_VERSION} ${TARGETOS}/${TARGETARCH}"; exit 1 ;;
+  esac
+  tarball="cni-plugins-${TARGETOS}-${TARGETARCH}-${CNI_VERSION}.tgz"
+  curl -fsSL -o "/tmp/${tarball}" "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/${tarball}"
+  echo "${sha256}  /tmp/${tarball}" | sha256sum -c -
+  tar xzvf "/tmp/${tarball}"
+  rm "/tmp/${tarball}"
+EOT
 RUN xx-verify --static bridge loopback host-local
 COPY --link --from=dnsname /usr/bin/dnsname /opt/cni/bin/
 
@@ -441,13 +460,23 @@ RUN apk add --no-cache shadow shadow-uidmap sudo vim iptables ip6tables dnsmasq 
   && ln -s /sbin/iptables-legacy /usr/bin/iptables \
   && xx-go --wrap
 ARG NERDCTL_VERSION
-RUN curl -fsSL https://raw.githubusercontent.com/containerd/nerdctl/$NERDCTL_VERSION/extras/rootless/containerd-rootless.sh > /usr/bin/containerd-rootless.sh \
-  && chmod 0755 /usr/bin/containerd-rootless.sh
+# Update the checksum together with NERDCTL_VERSION.
+RUN <<EOT
+  set -e
+  case "${NERDCTL_VERSION}" in
+    v2.2.1) sha256=1f8101ce7680ce4533ced18b4e3e39bd300c08210c336d30f6969c8cb1727a7c ;;
+    *) echo >&2 "no pinned sha256 for containerd-rootless.sh at nerdctl ${NERDCTL_VERSION}"; exit 1 ;;
+  esac
+  curl -fsSL -o /usr/bin/containerd-rootless.sh "https://raw.githubusercontent.com/containerd/nerdctl/${NERDCTL_VERSION}/extras/rootless/containerd-rootless.sh"
+  echo "${sha256}  /usr/bin/containerd-rootless.sh" | sha256sum -c -
+  chmod 0755 /usr/bin/containerd-rootless.sh
+EOT
 ARG AZURITE_VERSION
 RUN apk add --no-cache nodejs npm \
   && npm install -g azurite@${AZURITE_VERSION}
 # The entrypoint script is needed for enabling nested cgroup v2 (https://github.com/moby/buildkit/issues/3265#issuecomment-1309631736)
-RUN curl -fsSL https://raw.githubusercontent.com/moby/moby/v25.0.1/hack/dind > /docker-entrypoint.sh \
+RUN curl -fsSL -o /docker-entrypoint.sh https://raw.githubusercontent.com/moby/moby/v25.0.1/hack/dind \
+  && echo "e83f2e027d97dd7720fcf9e547bac78aefa99bdb62dfa7b12f78edd113ab2c17  /docker-entrypoint.sh" | sha256sum -c - \
   && chmod 0755 /docker-entrypoint.sh
 ENTRYPOINT ["/docker-entrypoint.sh"]
 # musl is needed to directly use the registry binary that is built on alpine
