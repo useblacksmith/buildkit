@@ -91,6 +91,10 @@ provenanceEnvDir = "/etc/buildkit/provenance.d"
   # collector will attempt to leave - however, it will never be bought below
   # reservedSpace.
   minFreeSpace = "20GB"
+  # gcSliceSize bounds how much cache a garbage collection pass releases
+  # before the released snapshots and content are removed from disk; the
+  # pass repeats until nothing is left to release. Defaults to 4GB.
+  gcSliceSize = "4GB"
   # alternate OCI worker binary name(example 'crun'), by default either 
   # buildkit-runc or runc binary is used
   binary = ""

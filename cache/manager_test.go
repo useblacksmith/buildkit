@@ -26,6 +26,7 @@ import (
 	"github.com/containerd/containerd/v2/core/snapshots"
 	ctdcompression "github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/archive/tarheader"
+	"github.com/containerd/containerd/v2/pkg/gc"
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/plugins/content/local"
@@ -59,10 +60,12 @@ import (
 )
 
 type cmOpt struct {
-	snapshotterName string
-	snapshotter     snapshots.Snapshotter
-	tmpdir          string
-	pruneInUse      bool
+	snapshotterName  string
+	snapshotter      snapshots.Snapshotter
+	tmpdir           string
+	pruneInUse       bool
+	pruneSliceBytes  int64
+	onGarbageCollect func(context.Context)
 }
 
 type cmOut struct {
@@ -145,17 +148,26 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, c
 		return md.Close()
 	})
 
+	garbageCollect := mdb.GarbageCollect
+	if opt.onGarbageCollect != nil {
+		garbageCollect = func(ctx context.Context) (gc.Stats, error) {
+			opt.onGarbageCollect(ctx)
+			return mdb.GarbageCollect(ctx)
+		}
+	}
+
 	cm, err := NewManager(ManagerOpt{
-		Snapshotter:    snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil),
-		MetadataStore:  md,
-		ContentStore:   store,
-		LeaseManager:   lm,
-		GarbageCollect: mdb.GarbageCollect,
-		Applier:        applier,
-		Differ:         differ,
-		Root:           tmpdir,
-		MountPoolRoot:  filepath.Join(tmpdir, "cachemounts"),
-		PruneInUse:     opt.pruneInUse,
+		Snapshotter:     snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil),
+		MetadataStore:   md,
+		ContentStore:    store,
+		LeaseManager:    lm,
+		GarbageCollect:  garbageCollect,
+		Applier:         applier,
+		Differ:          differ,
+		Root:            tmpdir,
+		MountPoolRoot:   filepath.Join(tmpdir, "cachemounts"),
+		PruneInUse:      opt.pruneInUse,
+		PruneSliceBytes: opt.pruneSliceBytes,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -2637,6 +2649,106 @@ func TestPruneReloadedChildKeepsParentLastUsed(t *testing.T) {
 	require.NotContains(t, after, childID)
 	require.Equal(t, before[parentID].UsageCount, after[parentID].UsageCount)
 	require.Equal(t, before[parentID].LastUsedAt.UnixNano(), after[parentID].LastUsedAt.UnixNano())
+}
+
+// pruneSliceFixture creates n independent 1MiB layers and returns a manager
+// whose GarbageCollect hook is intercepted by onGC.
+func pruneSliceFixture(ctx context.Context, t *testing.T, n int, sliceBytes int64, onGC func(context.Context)) Manager {
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{
+		snapshotterName:  "native",
+		pruneSliceBytes:  sliceBytes,
+		onGarbageCollect: onGC,
+	})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager
+
+	for range n {
+		snap := commitWithFile(ctx, t, cm, nil, "data", 1<<20)
+		require.NoError(t, snap.Release(ctx))
+	}
+	// warm the size cache so the slice budget can be applied up front
+	checkDiskUsage(ctx, t, cm, 0, n)
+	return cm
+}
+
+func TestPruneSlicesGarbageCollection(t *testing.T) {
+	// Prune must hand the released records to the garbage collector in
+	// bounded slices instead of releasing everything first, so that the
+	// physical cleanup outstanding at any time stays bounded.
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	var cm Manager
+	var remaining []int
+	cm = pruneSliceFixture(ctx, t, 6, 2<<20+1<<19, func(ctx context.Context) {
+		du, err := cm.DiskUsage(ctx, client.DiskUsageInfo{})
+		require.NoError(t, err)
+		remaining = append(remaining, len(du))
+	})
+
+	buf := pruneResultBuffer()
+	err := cm.Prune(ctx, buf.C, client.PruneInfo{All: true})
+	buf.close()
+	require.NoError(t, err)
+	require.Len(t, buf.all, 6)
+
+	// 1MiB records against a 2.5MiB slice: three per slice, then a final
+	// pass that finds nothing left to release
+	require.Equal(t, []int{3, 0, 0}, remaining)
+	checkDiskUsage(ctx, t, cm, 0, 0)
+}
+
+func TestPruneUnslicedRunsGarbageCollectionOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+
+	gcCalls := 0
+	cm := pruneSliceFixture(ctx, t, 4, 0, func(context.Context) {
+		gcCalls++
+	})
+
+	buf := pruneResultBuffer()
+	err := cm.Prune(ctx, buf.C, client.PruneInfo{All: true})
+	buf.close()
+	require.NoError(t, err)
+	require.Len(t, buf.all, 4)
+	require.Equal(t, 1, gcCalls)
+	checkDiskUsage(ctx, t, cm, 0, 0)
+}
+
+func TestPruneStopsAtSliceBoundaryWhenCancelled(t *testing.T) {
+	// A cancelled prune must stop after the slice in progress has been
+	// garbage collected and leave the remaining records intact, so that a
+	// shutdown never discards the work done so far.
+	t.Parallel()
+
+	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	pruneCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	gcCalls := 0
+	cm := pruneSliceFixture(ctx, t, 4, 1, func(context.Context) {
+		gcCalls++
+		cancel(errors.New("shutting down"))
+	})
+
+	buf := pruneResultBuffer()
+	err := cm.Prune(pruneCtx, buf.C, client.PruneInfo{All: true})
+	buf.close()
+	require.ErrorIs(t, err, context.Canceled)
+	require.Len(t, buf.all, 1)
+	require.Equal(t, 1, gcCalls)
+	checkDiskUsage(ctx, t, cm, 0, 3)
+
+	buf = pruneResultBuffer()
+	err = cm.Prune(ctx, buf.C, client.PruneInfo{All: true})
+	buf.close()
+	require.NoError(t, err)
+	require.Len(t, buf.all, 3)
+	checkDiskUsage(ctx, t, cm, 0, 0)
 }
 
 func TestCalculateKeepBytes(t *testing.T) {

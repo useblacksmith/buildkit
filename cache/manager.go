@@ -44,6 +44,11 @@ var (
 
 const maxPruneBatch = 10 // maximum number of refs to prune while holding the manager lock
 
+// DefaultPruneSliceBytes is the default upper bound on how much cache Prune
+// releases from metadata before handing the released snapshots and content to
+// the garbage collector for physical removal.
+const DefaultPruneSliceBytes = 4 << 30
+
 type ManagerOpt struct {
 	Snapshotter     snapshot.Snapshotter
 	ContentStore    content.Store
@@ -58,6 +63,13 @@ type ManagerOpt struct {
 	// PruneInUse lets a size-bounded prune with all=true remove records that
 	// still have live refs (e.g. held by child records or an active solve).
 	PruneInUse bool
+	// PruneSliceBytes bounds how much cache Prune releases from metadata
+	// before running GarbageCollect to reclaim it physically; Prune repeats
+	// until nothing is left to release. This keeps the physical cleanup that
+	// is outstanding at any point bounded so that a cancelled context stops
+	// the prune promptly with the work done so far fully persisted. Zero
+	// disables slicing.
+	PruneSliceBytes int64
 }
 
 type Accessor interface {
@@ -102,8 +114,9 @@ type cacheManager struct {
 	Differ          diff.Comparer
 	MetadataStore   *metadata.Store
 
-	root       string
-	pruneInUse bool
+	root            string
+	pruneInUse      bool
+	pruneSliceBytes int64
 
 	mountPool sharableMountPool
 
@@ -123,6 +136,7 @@ func NewManager(opt ManagerOpt) (Manager, error) {
 		MetadataStore:   opt.MetadataStore,
 		root:            opt.Root,
 		pruneInUse:      opt.PruneInUse,
+		pruneSliceBytes: opt.PruneSliceBytes,
 		records:         make(map[string]*cacheRecord),
 	}
 
@@ -1018,37 +1032,67 @@ func (cm *cacheManager) createDiffRef(ctx context.Context, parents parentRefs, d
 }
 
 func (cm *cacheManager) Prune(ctx context.Context, ch chan client.UsageInfo, opts ...client.PruneInfo) error {
-	cm.muPrune.Lock()
-
-	for _, opt := range opts {
-		if err := cm.prune(ctx, ch, opt); err != nil {
-			cm.muPrune.Unlock()
+	for {
+		more, err := cm.pruneSlice(ctx, ch, opts)
+		if err != nil {
 			return err
 		}
-	}
 
-	cm.muPrune.Unlock()
-
-	if cm.GarbageCollect != nil {
-		if _, err := cm.GarbageCollect(ctx); err != nil {
-			return err
+		if cm.GarbageCollect != nil {
+			if _, err := cm.GarbageCollect(ctx); err != nil {
+				return err
+			}
 		}
-	}
 
-	return nil
+		if !more {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		default:
+		}
+		bklog.G(ctx).Debugf("prune slice of %d bytes garbage collected, continuing", cm.pruneSliceBytes)
+	}
 }
 
-func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt client.PruneInfo) error {
+// pruneSlice runs the prune policies in order, releasing at most
+// cm.pruneSliceBytes in total. It reports whether a policy was cut short by
+// that budget and still has records to release.
+func (cm *cacheManager) pruneSlice(ctx context.Context, ch chan client.UsageInfo, opts []client.PruneInfo) (more bool, err error) {
+	cm.muPrune.Lock()
+	defer cm.muPrune.Unlock()
+
+	budget := cm.pruneSliceBytes
+	for _, opt := range opts {
+		released, cut, err := cm.prune(ctx, ch, opt, budget)
+		if err != nil {
+			return false, err
+		}
+		if cut {
+			return true, nil
+		}
+		if budget > 0 {
+			budget -= released // not cut, so released < budget
+		}
+	}
+	return false, nil
+}
+
+// prune releases records matching opt until none are left or, when budget is
+// positive, until at least budget bytes have been released. It returns the
+// number of bytes released and whether it stopped because of the budget.
+func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt client.PruneInfo, budget int64) (released int64, cut bool, err error) {
 	filter, err := filters.ParseAll(opt.Filter...)
 	if err != nil {
-		return errors.Wrapf(err, "failed to parse prune filters %v", opt.Filter)
+		return 0, false, errors.Wrapf(err, "failed to parse prune filters %v", opt.Filter)
 	}
 
 	var check ExternalRefChecker
 	if f := cm.PruneRefChecker; f != nil && (!opt.All || len(opt.Filter) > 0) {
 		c, err := f()
 		if err != nil {
-			return errors.WithStack(err)
+			return 0, false, errors.WithStack(err)
 		}
 		check = c
 	}
@@ -1057,7 +1101,7 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 	if opt.MaxUsedSpace != 0 || opt.ReservedSpace != 0 || opt.MinFreeSpace != 0 {
 		du, err := cm.DiskUsage(ctx, client.DiskUsageInfo{})
 		if err != nil {
-			return err
+			return 0, false, err
 		}
 		for _, ui := range du {
 			if ui.Shared {
@@ -1071,7 +1115,7 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 	if opt.MinFreeSpace != 0 {
 		dstat, err = disk.GetDiskStat(cm.root)
 		if err != nil {
-			return err
+			return 0, false, err
 		}
 	}
 
@@ -1082,13 +1126,21 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 		keepDuration: opt.KeepDuration,
 		keepBytes:    calculateKeepBytes(totalSize, dstat, opt),
 		totalSize:    totalSize,
+		budget:       budget,
 	}
 	for {
 		releasedSize, releasedCount, err := cm.pruneOnce(ctx, ch, popt)
+		if releasedSize > 0 {
+			released += releasedSize
+		}
 		if err != nil || releasedCount == 0 {
-			return err
+			return released, false, err
+		}
+		if budget > 0 && released >= budget {
+			return released, true, nil
 		}
 		popt.totalSize -= releasedSize
+		popt.budget = budget - released
 	}
 }
 
@@ -1212,6 +1264,24 @@ func (cm *cacheManager) pruneOnce(ctx context.Context, ch chan client.UsageInfo,
 		batchSize = 1
 	} else if batchSize > maxPruneBatch {
 		batchSize = maxPruneBatch
+	}
+	if opt.budget > 0 {
+		// shrink the batch to the records that fit in the remaining budget,
+		// always taking at least one so that progress is made
+		var acc int64
+		for i, cr := range toDelete[:batchSize] {
+			if i > 0 && acc >= opt.budget {
+				batchSize = i
+				break
+			}
+			size := cr.getSize()
+			if size == sizeUnknown && cr.equalImmutable != nil {
+				size = cr.equalImmutable.getSize()
+			}
+			if size > 0 {
+				acc += size
+			}
+		}
 	}
 
 	releaseLocks := func() {
@@ -1689,6 +1759,9 @@ type pruneOpt struct {
 
 	keepBytes int64
 	totalSize int64
+	// budget is the number of bytes left to release in the current slice;
+	// zero means unbounded
+	budget int64
 }
 
 type deleteRecord struct {
