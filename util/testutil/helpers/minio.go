@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	minioBin = "minio"
-	mcBin    = "mc"
+	siloBin = "silo"
+	mcBin   = "mc"
 )
 
 type MinioOpts struct {
@@ -30,8 +30,8 @@ func NewMinioServer(t *testing.T, sb integration.Sandbox, opts MinioOpts) (addre
 	t.Helper()
 	bucket = randomString(10)
 
-	if _, err := exec.LookPath(minioBin); err != nil {
-		return "", "", nil, errors.Wrapf(err, "failed to lookup %s binary", minioBin)
+	if _, err := exec.LookPath(siloBin); err != nil {
+		return "", "", nil, errors.Wrapf(err, "failed to lookup %s binary", siloBin)
 	}
 	if _, err := exec.LookPath(mcBin); err != nil {
 		return "", "", nil, errors.Wrapf(err, "failed to lookup %s binary", mcBin)
@@ -60,7 +60,7 @@ func NewMinioServer(t *testing.T, sb integration.Sandbox, opts MinioOpts) (addre
 	address = "http://" + addr
 
 	// start server
-	cmd := exec.CommandContext(context.TODO(), minioBin, "server", "--json", "--address", addr, t.TempDir())
+	cmd := exec.CommandContext(context.TODO(), siloBin, "server", "--json", "--address", addr, t.TempDir())
 	cmd.Env = append(os.Environ(), []string{
 		"MINIO_ROOT_USER=" + opts.AccessKeyID,
 		"MINIO_ROOT_PASSWORD=" + opts.SecretAccessKey,
