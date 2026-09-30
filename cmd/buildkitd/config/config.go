@@ -101,6 +101,12 @@ type GCConfig struct {
 	GCMaxUsedSpace  DiskSpace  `toml:"maxUsedSpace"`
 	GCMinFreeSpace  DiskSpace  `toml:"minFreeSpace"`
 	GCPolicy        []GCPolicy `toml:"gcpolicy"`
+	// GCSliceSize bounds how much cache a prune releases from metadata before
+	// the released snapshots and content are garbage collected from disk, so
+	// that the physical cleanup outstanding at any time (and the time needed
+	// to stop a prune on shutdown) stays bounded. Unset uses the built-in
+	// default.
+	GCSliceSize DiskSpace `toml:"gcSliceSize"`
 }
 
 type NetworkConfig struct {

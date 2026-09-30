@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/defaults"
@@ -22,6 +23,7 @@ import (
 	"github.com/containerd/platforms"
 	sddaemon "github.com/coreos/go-systemd/v22/daemon"
 	"github.com/gofrs/flock"
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/cache/remotecache/azblob"
 	"github.com/moby/buildkit/cache/remotecache/gha"
@@ -365,7 +367,13 @@ func main() {
 		if err != nil {
 			return err
 		}
-		defer controller.Close()
+		defer func() {
+			st := time.Now()
+			if err := controller.Close(); err != nil {
+				bklog.G(ctx).Errorf("failed to close controller: %v", err)
+			}
+			bklog.G(ctx).Infof("controller closed in %s", time.Since(st))
+		}()
 
 		healthv1.RegisterHealthServer(server, health.NewServer())
 		controller.Register(server)
@@ -411,7 +419,7 @@ func main() {
 			notified, notifyErr := sddaemon.SdNotify(false, sddaemon.SdNotifyStopping)
 			bklog.G(ctx).Debugf("SdNotifyStopping notified=%v, err=%v", notified, notifyErr)
 		}
-		server.GracefulStop()
+		stopServer(ctx, server, gracefulStopTimeout)
 
 		return err
 	}
@@ -464,6 +472,28 @@ func newGRPCListeners(cfg config.GRPCConfig) ([]net.Listener, error) {
 		listeners = append(listeners, l)
 	}
 	return listeners, nil
+}
+
+// gracefulStopTimeout bounds how long shutdown waits for in-flight RPCs and
+// lingering client connections before closing them forcibly, so that the
+// stores still get closed cleanly within the supervisor's kill timeout.
+const gracefulStopTimeout = 10 * time.Second
+
+func stopServer(ctx context.Context, server *grpc.Server, timeout time.Duration) {
+	st := time.Now()
+	stopped := make(chan struct{})
+	go func() {
+		server.GracefulStop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(timeout):
+		bklog.G(ctx).Warnf("graceful stop did not complete in %s, closing connections", timeout)
+		server.Stop()
+		<-stopped
+	}
+	bklog.G(ctx).Infof("server stopped in %s", time.Since(st))
 }
 
 func serveGRPC(server *grpc.Server, listeners []net.Listener, errCh chan error) error {
@@ -983,6 +1013,14 @@ func getGCPolicy(cfg config.GCConfig, root string) []client.PruneInfo {
 		})
 	}
 	return out
+}
+
+func getGCSliceBytes(cfg config.GCConfig, root string) int64 {
+	if cfg.GCSliceSize == (config.DiskSpace{}) {
+		return cache.DefaultPruneSliceBytes
+	}
+	dstat, _ := disk.GetDiskStat(root)
+	return cfg.GCSliceSize.AsBytes(dstat)
 }
 
 func getBuildkitVersion() client.BuildkitVersion {
