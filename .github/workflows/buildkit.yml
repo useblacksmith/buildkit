@@ -33,7 +33,7 @@ env:
 
 jobs:
   prepare:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       binaries-platforms: ${{ steps.platforms.outputs.matrix }}
     steps:
@@ -66,7 +66,7 @@ jobs:
       sign: ${{ github.event_name != 'pull_request' }}
 
   binaries-finalize:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs:
       - binaries
     steps:
@@ -139,18 +139,15 @@ jobs:
       codecov_token: ${{ secrets.CODECOV_TOKEN }}
 
   govulncheck:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read # same as global permission
       security-events: write # required to write sarif report
     steps:
       -
         name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-        with:
-          version: ${{ env.SETUP_BUILDX_VERSION }}
-          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
-          buildkitd-flags: --debug
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
       -
         name: Run
         uses: docker/bake-action@82490499d2e5613fcead7e128237ef0b0ea210f7 # v7.0.0
@@ -166,7 +163,7 @@ jobs:
           sarif_file: ${{ env.DESTDIR }}/govulncheck.out
 
   image-prepare:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       includes: ${{ steps.set.outputs.includes }}
     steps:
@@ -288,7 +285,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
   scout:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: ${{ github.ref == 'refs/heads/master' && github.repository == 'moby/buildkit' }}
     permissions:
       # same as global permission
@@ -332,7 +329,7 @@ jobs:
           sarif_file: ${{ steps.scout.outputs.result-file }}
 
   release:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       # required to create GitHub release
       contents: write
