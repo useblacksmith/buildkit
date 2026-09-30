@@ -98,6 +98,8 @@ type Controller struct { // TODO: ControlService
 	throttledGC                  func()
 	throttledReleaseUnreferenced func()
 	gcmu                         sync.Mutex
+	gcCtx                        context.Context
+	gcCancel                     context.CancelCauseFunc
 	tracev1.UnimplementedTraceServiceServer
 }
 
@@ -140,6 +142,7 @@ func NewController(opt Opt) (*Controller, error) {
 		cache:            opt.CacheManager,
 		gatewayForwarder: gatewayForwarder,
 	}
+	c.gcCtx, c.gcCancel = context.WithCancelCause(context.Background())
 	c.throttledGC = throttle.After(time.Minute, c.gc)
 	// use longer interval for releaseUnreferencedCache deleting links quickly is less important
 	c.throttledReleaseUnreferenced = throttle.After(5*time.Minute, func() { c.releaseUnreferencedCache(context.TODO()) })
@@ -160,6 +163,13 @@ func NewController(opt Opt) (*Controller, error) {
 }
 
 func (c *Controller) Close() error {
+	// stop any running gc before closing the stores it works on; a sliced
+	// prune stops at the next slice boundary with everything before it
+	// already persisted
+	c.gcCancel(errors.New("controller closed"))
+	c.gcmu.Lock()
+	c.gcmu.Unlock() //nolint:staticcheck // wait for a running gc to exit
+
 	var errs []error
 	if err := c.opt.HistoryDB.Close(); err != nil {
 		errs = append(errs, err)
@@ -679,12 +689,16 @@ func (c *Controller) gc() {
 	c.gcmu.Lock()
 	defer c.gcmu.Unlock()
 
+	if c.gcCtx.Err() != nil {
+		return
+	}
+
 	workers, err := c.opt.WorkerController.List()
 	if err != nil {
 		return
 	}
 
-	eg, ctx := errgroup.WithContext(context.TODO())
+	eg, ctx := errgroup.WithContext(c.gcCtx)
 
 	var size int64
 	ch := make(chan client.UsageInfo)
@@ -707,10 +721,14 @@ func (c *Controller) gc() {
 
 	err = eg.Wait()
 	close(ch)
+	<-done
 	if err != nil {
+		if c.gcCtx.Err() != nil {
+			bklog.G(ctx).Debugf("gc stopped after cleaning up %d bytes: %v", size, err)
+			return
+		}
 		bklog.G(ctx).Errorf("gc error: %+v", err)
 	}
-	<-done
 	if size > 0 {
 		bklog.G(ctx).Debugf("gc cleaned up %d bytes", size)
 		go c.throttledReleaseUnreferenced()

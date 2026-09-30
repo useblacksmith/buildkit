@@ -95,6 +95,7 @@ type WorkerOpt struct {
 	ResourceMonitor  *resources.Monitor
 	CDIManager       *cdidevices.Manager
 	PruneInUse       bool
+	PruneSliceBytes  int64
 }
 
 // Worker is a local worker instance with dedicated snapshotter, cache, and so on.
@@ -130,6 +131,7 @@ func NewWorker(ctx context.Context, opt WorkerOpt) (*Worker, error) {
 		Root:            opt.Root,
 		MountPoolRoot:   opt.MountPoolRoot,
 		PruneInUse:      opt.PruneInUse,
+		PruneSliceBytes: opt.PruneSliceBytes,
 	})
 	if err != nil {
 		return nil, err
