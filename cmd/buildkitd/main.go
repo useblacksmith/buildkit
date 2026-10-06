@@ -275,6 +275,8 @@ func main() {
 			logrus.SetLevel(logrus.TraceLevel)
 		}
 
+		applyOperatorConfig(ctx, &cfg)
+
 		if sc := cfg.System; sc != nil {
 			if v := sc.PlatformsCacheMaxAge; v != nil {
 				archutil.CacheMaxAge = v.Duration
@@ -522,6 +524,46 @@ func defaultConfigPath() string {
 		return filepath.Join(appdefaults.UserConfigDir(), "buildkitd.toml")
 	}
 	return filepath.Join(appdefaults.ConfigDir, "buildkitd.toml")
+}
+
+// operatorConfigPath is the operator-managed GC floor that
+// applyOperatorConfig merges into the worker configs. It sits next to the
+// system buildkitd.toml so that an image or host can carry a policy that
+// takes effect whatever --config a client starts the daemon with.
+func operatorConfigPath() string {
+	return filepath.Join(appdefaults.ConfigDir, "operator.toml")
+}
+
+// applyOperatorConfig loads the operator GC floor, if any, and applies it to
+// every worker whose config disabled gc without declaring a gcpolicy. See
+// config.ApplyOperatorGC for the exact rules. Problems with the operator file
+// are logged and otherwise ignored so a bad floor can never keep the daemon
+// from starting.
+func applyOperatorConfig(ctx context.Context, cfg *config.Config) {
+	path := operatorConfigPath()
+	op, err := config.LoadFile(path)
+	if err != nil {
+		bklog.G(ctx).Warnf("ignoring operator config %s: %v", path, err)
+		return
+	}
+	ociPruneInUse := cfg.Workers.OCI.PruneInUse == nil || *cfg.Workers.OCI.PruneInUse
+	for _, w := range []struct {
+		name       string
+		dst        *config.GCConfig
+		op         config.GCConfig
+		pruneInUse bool
+	}{
+		{"oci", &cfg.Workers.OCI.GCConfig, op.Workers.OCI.GCConfig, ociPruneInUse},
+		{"containerd", &cfg.Workers.Containerd.GCConfig, op.Workers.Containerd.GCConfig, true},
+	} {
+		applied, err := config.ApplyOperatorGC(w.dst, w.op, w.pruneInUse)
+		switch {
+		case err != nil:
+			bklog.G(ctx).Warnf("not applying operator gc policy from %s to %s worker: %v", path, w.name, err)
+		case applied:
+			bklog.G(ctx).Infof("%s worker: gc disabled without a gcpolicy, applying operator gc policy from %s", w.name, path)
+		}
+	}
 }
 
 func defaultConf() (config.Config, error) {
