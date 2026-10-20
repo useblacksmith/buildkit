@@ -1598,7 +1598,10 @@ func dispatchHealthcheck(d *dispatchState, c *instructions.HealthCheckCommand, l
 		StartInterval: c.Health.StartInterval,
 		Retries:       c.Health.Retries,
 	}
-	return commitToHistory(&d.image, fmt.Sprintf("HEALTHCHECK &%q", *d.image.Config.Healthcheck), false, nil, d.epoch)
+	hc := d.image.Config.Healthcheck
+	// matches the historical %q formatting of the *HealthcheckConfig pointer
+	desc := fmt.Sprintf("HEALTHCHECK &{%q %q %q %q %q %q}", hc.Test, hc.Interval, hc.Timeout, hc.StartPeriod, hc.StartInterval, rune(hc.Retries))
+	return commitToHistory(&d.image, desc, false, nil, d.epoch)
 }
 
 func dispatchUser(d *dispatchState, c *instructions.UserCommand, commit bool) error {
