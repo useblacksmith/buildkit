@@ -31,23 +31,23 @@ full avg10=0.12 avg60=0.34 avg300=0.56 total=9876`
 			Avg10:  new(1.23),
 			Avg60:  new(4.56),
 			Avg300: new(7.89),
-			Total:  new(3031),
+			Total:  new(uint64(3031)),
 		},
 		Full: &resourcestypes.PressureValues{
 			Avg10:  new(0.12),
 			Avg60:  new(0.34),
 			Avg300: new(0.56),
-			Total:  new(9876),
+			Total:  new(uint64(9876)),
 		},
 	}
 
 	expectedIOStat := &resourcestypes.IOStat{
-		ReadBytes:    new(1024 + 512),
-		WriteBytes:   new(2048 + 1024),
-		DiscardBytes: new(4096 + 2048),
-		ReadIOs:      new(16 + 8),
-		WriteIOs:     new(32 + 16),
-		DiscardIOs:   new(64 + 32),
+		ReadBytes:    new(uint64(1024 + 512)),
+		WriteBytes:   new(uint64(2048 + 1024)),
+		DiscardBytes: new(uint64(4096 + 2048)),
+		ReadIOs:      new(uint64(16 + 8)),
+		WriteIOs:     new(uint64(32 + 16)),
+		DiscardIOs:   new(uint64(64 + 32)),
 		Pressure:     expectedPressure,
 	}
 	assert.Equal(t, expectedIOStat, ioStat)
