@@ -236,3 +236,26 @@ certificateIssuer = ""
 subjectAlternativeName = ""
 buildSignerURI = ""
 ```
+
+## Operator GC policy
+
+`buildkitd` also reads `/etc/buildkit/operator.toml` (`%ProgramData%\buildkitd\operator.toml`
+on Windows), independent of `--config`. It uses the same schema, but only the
+`gc` and `gcpolicy` keys of each worker are read, and they are applied only to a
+worker whose own config sets `gc = false` without declaring any `gcpolicy`. A
+config that enables gc, or that declares its own policy, is never changed. This
+lets the environment that ships `buildkitd` impose a garbage collection floor
+on clients that start the daemon with gc disabled.
+
+A size-based operator rule (`reservedSpace`, `maxUsedSpace`, `minFreeSpace`,
+`keepBytes`) is refused unless the worker config sets `pruneInUse = false`;
+time-based rules are always accepted. Problems with the file are logged and the
+daemon starts with the client's config unchanged.
+
+```toml
+[worker.oci]
+  gc = true
+  [[worker.oci.gcpolicy]]
+    keepDuration = "192h"
+    all = true
+```
